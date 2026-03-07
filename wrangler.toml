@@ -11,6 +11,16 @@ binding = "AI"
 binding = "SDB_TOKEN_CACHE"
 id = "01384d5461d74ea9b0150b7d11f312d3"
 
+# D1 Database for historical currency rates
+[[d1_databases]]
+binding = "DB"
+database_name = "currency-history-db"
+database_id = "59ba4d1e-dccb-4313-ac74-59c5c4461409"
+
+# Cron trigger to store daily rates (runs at 6 PM Myanmar Time / 11:30 UTC)
+[triggers]
+crons = ["30 11 * * *"]
+
 # Optional: Add your custom domain later
 # routes = [
 #   { pattern = "api.yourdomain.com/*", zone_name = "yourdomain.com" }

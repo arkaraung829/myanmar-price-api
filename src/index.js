@@ -102,7 +102,8 @@ export default {
               combined: ['/all'],
               sdb: ['/sdb/login', '/sdb/refresh', '/sdb/rates', '/sdb/decrypt'],
               meta: ['/sources'],
-              debug: ['/debug/telegram/ygea', '/debug/telegram/denko', '/debug/telegram/goldcurrency']
+              debug: ['/debug/telegram/ygea', '/debug/telegram/denko', '/debug/telegram/goldcurrency'],
+              admin: ['/admin/store-rates', '/admin/backfill?days=30']
             },
             recommended: {
               gold: '/gold/live - Real-time from @goldcurrencyupdate (TEXT)',
@@ -189,7 +190,18 @@ export default {
           if (currencyHistoryMatch) {
             const code = currencyHistoryMatch[1];
             const days = parseInt(url.searchParams.get('days') || '7', 10);
-            return await getCurrencyHistory(code, Math.min(Math.max(days, 1), 90));
+            return await getCurrencyHistoryFromDB(env, code, Math.min(Math.max(days, 1), 90));
+          }
+
+          // Backfill endpoint to populate historical data
+          if (path === '/admin/backfill') {
+            const days = parseInt(url.searchParams.get('days') || '30', 10);
+            return await backfillHistoricalData(env, Math.min(days, 90));
+          }
+
+          // Manual trigger to store today's rates
+          if (path === '/admin/store-rates') {
+            return await storeDailyRates(env);
           }
 
           return jsonResponse({ error: 'Not found' }, 404);
@@ -197,6 +209,11 @@ export default {
     } catch (error) {
       return jsonResponse({ error: error.message }, 500);
     }
+  },
+
+  // Scheduled handler - runs daily to store currency rates
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(storeDailyRates(env));
   }
 };
 
@@ -426,84 +443,242 @@ async function getMarketCurrency() {
   });
 }
 
-// Get historical currency rates for a specific currency
-async function getCurrencyHistory(code, days = 7) {
-  const history = [];
-  const today = new Date();
+// Get historical currency rates from D1 database
+async function getCurrencyHistoryFromDB(env, code, days = 7) {
+  if (!env?.DB) {
+    return jsonResponse({ error: 'Database not configured' }, 500);
+  }
 
-  // Fetch data for each day in parallel (batch of 10 to avoid rate limiting)
-  const batchSize = 10;
-  const dates = [];
+  try {
+    const result = await env.DB.prepare(`
+      SELECT date, buy_rate, sell_rate, source
+      FROM currency_rates
+      WHERE currency_code = ?
+      ORDER BY date DESC
+      LIMIT ?
+    `).bind(code, days).all();
+
+    const history = result.results.map(row => ({
+      date: row.date,
+      buy: row.buy_rate.toString(),
+      sell: row.sell_rate.toString()
+    }));
+
+    return jsonResponse({
+      currency: code,
+      source: 'SDB (Historical DB)',
+      days: days,
+      history: history,
+      dataPoints: history.length,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    return jsonResponse({ error: 'Database query failed: ' + error.message }, 500);
+  }
+}
+
+// Store daily rates from SDB to D1 database
+async function storeDailyRates(env) {
+  if (!env?.DB) {
+    return jsonResponse({ error: 'Database not configured' }, 500);
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+  let rates = {};
+  let source = 'SDB';
+
+  try {
+    // Try to get rates from SDB first
+    const email = env?.SDB_EMAIL;
+    const password = env?.SDB_PASSWORD;
+
+    if (email && password) {
+      // Login and get rates from SDB
+      const encryptedPayload = await encryptJWE({ email, password });
+      const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ encrypt: encryptedPayload })
+      });
+
+      if (loginResponse.ok) {
+        const loginData = await loginResponse.json();
+        let accessToken;
+
+        if (loginData.encrypt) {
+          const decrypted = await decryptJWE(loginData.encrypt);
+          const parsedLogin = JSON.parse(decrypted);
+          accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
+        }
+
+        if (accessToken) {
+          const ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${accessToken}`, 'Accept': 'application/json' }
+          });
+
+          if (ratesResponse.ok) {
+            const ratesData = await ratesResponse.json();
+            if (ratesData.encrypt) {
+              const decrypted = await decryptJWE(ratesData.encrypt);
+              const parsed = JSON.parse(decrypted);
+              const ratesObj = parsed.data || parsed;
+              const exchangeRatesData = ratesObj.exchange_rates?.rates || [];
+
+              for (const rate of exchangeRatesData) {
+                const code = rate.base_currency?.code;
+                if (code && code !== 'GOLD' && code !== 'SDB') {
+                  rates[code] = {
+                    buy: parseFloat(rate.buy_rate),
+                    sell: parseFloat(rate.sell_rate)
+                  };
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // If SDB failed, fall back to MMP
+    if (Object.keys(rates).length === 0) {
+      source = 'MMP';
+      const response = await fetch(
+        `https://api.marketpricepro.com/users/home_content/data?is_today=true&category_id=102&date=${today}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${MMP_TOKEN}`,
+            'country': 'MM',
+            'language': 'en',
+            'Accept': 'application/json'
+          }
+        }
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.data?.[0]?.sub_categories?.[0]?.items) {
+          const items = data.data[0].sub_categories[0].items;
+          const grouped = {};
+          items.forEach(item => {
+            if (!grouped[item.item_name] || item.created_at_date > grouped[item.item_name].created_at_date) {
+              grouped[item.item_name] = item;
+            }
+          });
+          Object.values(grouped).forEach(item => {
+            rates[item.item_name] = {
+              buy: parseFloat(item.buy_price.replace(/,/g, '')),
+              sell: parseFloat(item.sell_price.replace(/,/g, ''))
+            };
+          });
+        }
+      }
+    }
+
+    // Store rates in D1
+    let stored = 0;
+    for (const [code, rate] of Object.entries(rates)) {
+      try {
+        await env.DB.prepare(`
+          INSERT OR REPLACE INTO currency_rates (date, currency_code, buy_rate, sell_rate, source)
+          VALUES (?, ?, ?, ?, ?)
+        `).bind(today, code, rate.buy, rate.sell, source).run();
+        stored++;
+      } catch (e) {
+        console.error(`Failed to store ${code}:`, e.message);
+      }
+    }
+
+    return jsonResponse({
+      success: true,
+      date: today,
+      source: source,
+      currenciesStored: stored,
+      rates: rates,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    return jsonResponse({ error: 'Failed to store rates: ' + error.message }, 500);
+  }
+}
+
+// Backfill historical data from MMP (one-time use)
+async function backfillHistoricalData(env, days = 30) {
+  if (!env?.DB) {
+    return jsonResponse({ error: 'Database not configured' }, 500);
+  }
+
+  const results = { success: [], failed: [] };
+  const today = new Date();
 
   for (let i = 0; i < days; i++) {
     const date = new Date(today);
     date.setDate(date.getDate() - i);
-    dates.push(date.toISOString().split('T')[0]);
-  }
+    const dateStr = date.toISOString().split('T')[0];
 
-  // Process dates in batches
-  for (let i = 0; i < dates.length; i += batchSize) {
-    const batch = dates.slice(i, i + batchSize);
-    const results = await Promise.all(
-      batch.map(async (dateStr) => {
-        try {
-          const response = await fetch(
-            `https://api.marketpricepro.com/users/home_content/data?is_today=false&category_id=102&date=${dateStr}`,
-            {
-              headers: {
-                'Authorization': `Bearer ${MMP_TOKEN}`,
-                'country': 'MM',
-                'language': 'en',
-                'Accept': 'application/json'
-              }
-            }
-          );
-
-          if (!response.ok) {
-            return { date: dateStr, error: 'API error' };
+    try {
+      const response = await fetch(
+        `https://api.marketpricepro.com/users/home_content/data?is_today=false&category_id=102&date=${dateStr}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${MMP_TOKEN}`,
+            'country': 'MM',
+            'language': 'en',
+            'Accept': 'application/json'
           }
-
-          const data = await response.json();
-
-          // Extract the specific currency rate
-          if (data.data && data.data[0] && data.data[0].sub_categories) {
-            const items = data.data[0].sub_categories[0].items || [];
-
-            // Find the currency and get the latest entry for that day
-            const currencyItems = items.filter(item => item.item_name === code);
-            if (currencyItems.length > 0) {
-              // Sort by created_at_date to get latest
-              currencyItems.sort((a, b) => b.created_at_date.localeCompare(a.created_at_date));
-              const item = currencyItems[0];
-              return {
-                date: dateStr,
-                buy: item.buy_price,
-                sell: item.sell_price
-              };
-            }
-          }
-
-          return { date: dateStr, buy: null, sell: null };
-        } catch (error) {
-          return { date: dateStr, error: error.message };
         }
-      })
-    );
+      );
 
-    history.push(...results);
+      if (!response.ok) {
+        results.failed.push({ date: dateStr, error: 'API error' });
+        continue;
+      }
+
+      const data = await response.json();
+      if (data.data?.[0]?.sub_categories?.[0]?.items) {
+        const items = data.data[0].sub_categories[0].items;
+        const grouped = {};
+        items.forEach(item => {
+          if (!grouped[item.item_name] || item.created_at_date > grouped[item.item_name].created_at_date) {
+            grouped[item.item_name] = item;
+          }
+        });
+
+        let stored = 0;
+        for (const item of Object.values(grouped)) {
+          try {
+            await env.DB.prepare(`
+              INSERT OR IGNORE INTO currency_rates (date, currency_code, buy_rate, sell_rate, source)
+              VALUES (?, ?, ?, ?, 'MMP_BACKFILL')
+            `).bind(
+              dateStr,
+              item.item_name,
+              parseFloat(item.buy_price.replace(/,/g, '')),
+              parseFloat(item.sell_price.replace(/,/g, ''))
+            ).run();
+            stored++;
+          } catch (e) {
+            // Ignore duplicate errors
+          }
+        }
+        results.success.push({ date: dateStr, currencies: stored });
+      }
+
+      // Small delay between requests to avoid rate limiting
+      await new Promise(r => setTimeout(r, 100));
+
+    } catch (error) {
+      results.failed.push({ date: dateStr, error: error.message });
+    }
   }
-
-  // Filter out entries with errors or null values
-  const validHistory = history.filter(h => h.buy !== null && h.sell !== null && !h.error);
-
-  // Sort by date descending (newest first)
-  validHistory.sort((a, b) => b.date.localeCompare(a.date));
 
   return jsonResponse({
-    currency: code,
-    source: 'MarketPricePro',
-    days: days,
-    history: validHistory,
+    message: 'Backfill complete',
+    daysProcessed: days,
+    successful: results.success.length,
+    failed: results.failed.length,
+    details: results,
     timestamp: new Date().toISOString()
   });
 }
