@@ -17,6 +17,11 @@ binding = "DB"
 database_name = "currency-history-db"
 database_id = "59ba4d1e-dccb-4313-ac74-59c5c4461409"
 
+# R2 bucket for ad images
+[[r2_buckets]]
+bucket_name = "ad-images"
+binding = "AD_IMAGES"
+
 # Cron trigger to store daily rates (runs at 6 PM Myanmar Time / 11:30 UTC)
 [triggers]
 crons = ["30 11 * * *"]

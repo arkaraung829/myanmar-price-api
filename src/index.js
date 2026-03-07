@@ -197,6 +197,13 @@ export default {
             return await getCurrencyHistoryFromDB(env, code, Math.min(Math.max(days, 1), 90));
           }
 
+          // Serve ad images from R2
+          const adImageMatch = path.match(/^\/ads\/(.+\.(png|jpg|jpeg|gif|webp))$/i);
+          if (adImageMatch) {
+            const filename = adImageMatch[1];
+            return await serveAdImage(env, filename);
+          }
+
           // Backfill endpoint to populate historical data
           if (path === '/admin/backfill') {
             const days = parseInt(url.searchParams.get('days') || '30', 10);
@@ -703,7 +710,7 @@ async function getAds(env) {
       id: 'oo_marketplace',
       title: 'OO Marketplace',
       description: 'Shop smart, shop local',
-      imageUrl: 'https://mm-price-api.mmpriceapi.workers.dev/static/oo-marketplace-banner.png',
+      imageUrl: 'https://mm-price-api.mmpriceapi.workers.dev/ads/oo-marketplace-banner.png',
       linkUrl: null, // Will be set based on platform in app
       appStoreUrl: 'https://apps.apple.com/app/oo-marketplace/id123456789',
       playStoreUrl: 'https://play.google.com/store/apps/details?id=com.oomarketplace.app',
@@ -738,6 +745,41 @@ async function getAds(env) {
       error: error.message,
       timestamp: new Date().toISOString()
     });
+  }
+}
+
+// Serve ad images from R2 storage
+async function serveAdImage(env, filename) {
+  try {
+    if (!env?.AD_IMAGES) {
+      return new Response('R2 not configured', { status: 500 });
+    }
+
+    const object = await env.AD_IMAGES.get(filename);
+
+    if (!object) {
+      return new Response('Image not found', { status: 404 });
+    }
+
+    // Determine content type from extension
+    const ext = filename.split('.').pop().toLowerCase();
+    const contentTypes = {
+      'png': 'image/png',
+      'jpg': 'image/jpeg',
+      'jpeg': 'image/jpeg',
+      'gif': 'image/gif',
+      'webp': 'image/webp'
+    };
+
+    const headers = new Headers({
+      'Content-Type': contentTypes[ext] || 'application/octet-stream',
+      'Cache-Control': 'public, max-age=86400', // Cache for 1 day
+      ...corsHeaders
+    });
+
+    return new Response(object.body, { headers });
+  } catch (error) {
+    return new Response(`Error serving image: ${error.message}`, { status: 500 });
   }
 }
 
