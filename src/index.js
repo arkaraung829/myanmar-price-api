@@ -1525,10 +1525,10 @@ async function sdbRefresh(request) {
 }
 
 /**
- * SDB Rates with Auto-Login
+ * SDB Rates with Auto-Login and Token Caching
+ * Uses KV storage to cache access tokens for 9 minutes (tokens expire in 10 min)
  * POST body: { "email": "...", "password": "..." }
  * Or use stored credentials in environment variables (SDB_EMAIL, SDB_PASSWORD)
- * This automatically logs in, gets token, fetches rates, and returns them
  */
 async function getSDBRatesAuto(request, env) {
   let email, password;
@@ -1563,60 +1563,123 @@ async function getSDBRatesAuto(request, env) {
   }
 
   try {
-    // Step 1: Encrypt login payload
-    const encryptedPayload = await encryptJWE({ email, password });
-
-    // Step 2: Login to get access token
-    const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify({ encrypt: encryptedPayload })
-    });
-
-    const loginData = await loginResponse.json();
-
-    if (!loginResponse.ok) {
-      return jsonResponse({
-        error: 'Login failed',
-        status: loginResponse.status,
-        sdbError: loginData,
-        emailUsed: email ? email.substring(0, 3) + '***' : 'none',
-        message: loginData.message || loginData.error || 'Authentication failed'
-      }, loginResponse.status);
-    }
-
-    // Decrypt login response to get token
     let accessToken;
-    let refreshToken;
-    if (loginData.encrypt) {
-      const decrypted = await decryptJWE(loginData.encrypt);
-      const parsedLogin = JSON.parse(decrypted);
-      // Token is nested under data.access_token
-      accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
-      refreshToken = parsedLogin.data?.refresh_token || parsedLogin.refreshToken;
-    } else {
-      accessToken = loginData.data?.access_token || loginData.accessToken;
-      refreshToken = loginData.data?.refresh_token || loginData.refreshToken;
+    let tokenSource = 'fresh_login';
+
+    // Step 1: Check for cached token in KV
+    if (env?.SDB_TOKEN_CACHE) {
+      const cachedToken = await env.SDB_TOKEN_CACHE.get('sdb_access_token');
+      if (cachedToken) {
+        accessToken = cachedToken;
+        tokenSource = 'cached';
+      }
     }
 
+    // Step 2: If no cached token, login to get new one
     if (!accessToken) {
-      return jsonResponse({
-        error: 'No access token received',
-        message: 'Login succeeded but no token was returned'
-      }, 500);
+      const encryptedPayload = await encryptJWE({ email, password });
+
+      const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ encrypt: encryptedPayload })
+      });
+
+      const loginData = await loginResponse.json();
+
+      if (!loginResponse.ok) {
+        return jsonResponse({
+          error: 'Login failed',
+          status: loginResponse.status,
+          sdbError: loginData,
+          emailUsed: email ? email.substring(0, 3) + '***' : 'none',
+          message: loginData.message || loginData.error || 'Authentication failed'
+        }, loginResponse.status);
+      }
+
+      // Decrypt login response to get token
+      if (loginData.encrypt) {
+        const decrypted = await decryptJWE(loginData.encrypt);
+        const parsedLogin = JSON.parse(decrypted);
+        accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
+      } else {
+        accessToken = loginData.data?.access_token || loginData.accessToken;
+      }
+
+      if (!accessToken) {
+        return jsonResponse({
+          error: 'No access token received',
+          message: 'Login succeeded but no token was returned'
+        }, 500);
+      }
+
+      // Cache the token for 9 minutes (540 seconds) - expires before the 10 min token expiry
+      if (env?.SDB_TOKEN_CACHE) {
+        await env.SDB_TOKEN_CACHE.put('sdb_access_token', accessToken, { expirationTtl: 540 });
+      }
     }
 
-    // Step 2: Fetch exchange rates with the token
-    const ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
+    // Step 3: Fetch exchange rates with the token
+    let ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${accessToken}`,
         'Accept': 'application/json'
       }
     });
+
+    // If token expired (401), clear cache and retry with fresh login
+    if (ratesResponse.status === 401 && tokenSource === 'cached') {
+      // Clear expired token from cache
+      if (env?.SDB_TOKEN_CACHE) {
+        await env.SDB_TOKEN_CACHE.delete('sdb_access_token');
+      }
+
+      // Login again
+      const encryptedPayload = await encryptJWE({ email, password });
+      const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ encrypt: encryptedPayload })
+      });
+
+      const loginData = await loginResponse.json();
+      if (!loginResponse.ok) {
+        return jsonResponse({
+          error: 'Re-login failed after token expiry',
+          status: loginResponse.status
+        }, loginResponse.status);
+      }
+
+      // Get new token
+      if (loginData.encrypt) {
+        const decrypted = await decryptJWE(loginData.encrypt);
+        const parsedLogin = JSON.parse(decrypted);
+        accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
+      }
+
+      // Cache the new token
+      if (env?.SDB_TOKEN_CACHE && accessToken) {
+        await env.SDB_TOKEN_CACHE.put('sdb_access_token', accessToken, { expirationTtl: 540 });
+      }
+
+      // Retry fetching rates
+      ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      tokenSource = 'refreshed';
+    }
 
     const ratesData = await ratesResponse.json();
 
@@ -1676,6 +1739,7 @@ async function getSDBRatesAuto(request, env) {
       source: 'Spring Development Bank',
       type: 'bank_rate',
       method: 'auto_login',
+      tokenSource, // 'cached', 'fresh_login', or 'refreshed'
       lastUpdated,
       rates,
       goldRate,

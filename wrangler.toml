@@ -6,10 +6,10 @@ compatibility_date = "2024-01-01"
 [ai]
 binding = "AI"
 
-# KV Storage for caching parsed prices (optional)
-# [[kv_namespaces]]
-# binding = "PRICE_CACHE"
-# id = "your-kv-namespace-id"
+# KV Storage for SDB token caching
+[[kv_namespaces]]
+binding = "SDB_TOKEN_CACHE"
+id = "01384d5461d74ea9b0150b7d11f312d3"
 
 # Optional: Add your custom domain later
 # routes = [
