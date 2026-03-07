@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MM Price Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <!-- Login Modal -->
+  <div id="loginModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div class="bg-white rounded-xl p-8 w-96 shadow-2xl">
+      <h2 class="text-2xl font-bold text-gray-800 mb-6 text-center">Admin Login</h2>
+      <input type="password" id="adminPassword" placeholder="Enter admin password"
+        class="w-full px-4 py-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500">
+      <button onclick="login()" class="w-full gradient-bg text-white py-3 rounded-lg font-semibold hover:opacity-90 transition">
+        Login
+      </button>
+      <p id="loginError" class="text-red-500 text-sm mt-2 hidden">Invalid password</p>
+    </div>
+  </div>
+
+  <!-- Main Content -->
+  <div id="mainContent" class="hidden">
+    <!-- Header -->
+    <header class="gradient-bg text-white py-6 px-8 shadow-lg">
+      <div class="max-w-6xl mx-auto flex justify-between items-center">
+        <h1 class="text-2xl font-bold">MM Price Admin</h1>
+        <button onclick="logout()" class="bg-white bg-opacity-20 px-4 py-2 rounded-lg hover:bg-opacity-30 transition">
+          Logout
+        </button>
+      </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto py-8 px-4">
+      <!-- Stats -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+        <div class="bg-white rounded-xl p-6 shadow-md">
+          <h3 class="text-gray-500 text-sm">Total Ads</h3>
+          <p id="totalAds" class="text-3xl font-bold text-gray-800">0</p>
+        </div>
+        <div class="bg-white rounded-xl p-6 shadow-md">
+          <h3 class="text-gray-500 text-sm">Active Ads</h3>
+          <p id="activeAds" class="text-3xl font-bold text-green-600">0</p>
+        </div>
+        <div class="bg-white rounded-xl p-6 shadow-md">
+          <h3 class="text-gray-500 text-sm">Images in R2</h3>
+          <p id="totalImages" class="text-3xl font-bold text-purple-600">-</p>
+        </div>
+      </div>
+
+      <!-- Add New Ad -->
+      <div class="bg-white rounded-xl p-6 shadow-md mb-8">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">Add / Edit Banner Ad</h2>
+        <form id="adForm" class="space-y-4">
+          <input type="hidden" id="adId">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
+              <input type="text" id="adTitle" required
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+              <input type="text" id="adDescription"
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Banner Image</label>
+            <div class="flex gap-4">
+              <input type="file" id="adImage" accept="image/*"
+                class="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+              <span id="currentImage" class="text-sm text-gray-500 self-center"></span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">App Store URL (iOS)</label>
+              <input type="url" id="adAppStore" placeholder="https://apps.apple.com/..."
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Play Store URL (Android)</label>
+              <input type="url" id="adPlayStore" placeholder="https://play.google.com/..."
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">External Link URL (optional)</label>
+            <input type="url" id="adLinkUrl" placeholder="https://..."
+              class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+          </div>
+
+          <div class="flex gap-4">
+            <button type="submit" class="gradient-bg text-white px-6 py-2 rounded-lg font-semibold hover:opacity-90 transition">
+              Save Ad
+            </button>
+            <button type="button" onclick="resetForm()" class="bg-gray-200 text-gray-700 px-6 py-2 rounded-lg font-semibold hover:bg-gray-300 transition">
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Ads List -->
+      <div class="bg-white rounded-xl p-6 shadow-md">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">All Ads</h2>
+        <div id="adsList" class="space-y-4">
+          <p class="text-gray-500">Loading ads...</p>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const API_BASE = '';
+    let authToken = localStorage.getItem('adminToken');
+
+    // Check if already logged in
+    if (authToken) {
+      verifyToken();
+    }
+
+    async function login() {
+      const password = document.getElementById('adminPassword').value;
+      try {
+        const res = await fetch(`${API_BASE}/admin/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (data.success) {
+          authToken = data.token;
+          localStorage.setItem('adminToken', authToken);
+          showDashboard();
+        } else {
+          document.getElementById('loginError').classList.remove('hidden');
+        }
+      } catch (e) {
+        document.getElementById('loginError').classList.remove('hidden');
+      }
+    }
+
+    async function verifyToken() {
+      try {
+        const res = await fetch(`${API_BASE}/admin/verify`, {
+          headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        if (res.ok) {
+          showDashboard();
+        } else {
+          logout();
+        }
+      } catch (e) {
+        logout();
+      }
+    }
+
+    function showDashboard() {
+      document.getElementById('loginModal').classList.add('hidden');
+      document.getElementById('mainContent').classList.remove('hidden');
+      loadAds();
+    }
+
+    function logout() {
+      localStorage.removeItem('adminToken');
+      authToken = null;
+      document.getElementById('loginModal').classList.remove('hidden');
+      document.getElementById('mainContent').classList.add('hidden');
+    }
+
+    async function loadAds() {
+      try {
+        const res = await fetch(`${API_BASE}/admin/ads`, {
+          headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        const data = await res.json();
+
+        document.getElementById('totalAds').textContent = data.ads.length;
+        document.getElementById('activeAds').textContent = data.ads.filter(a => a.is_active).length;
+
+        const container = document.getElementById('adsList');
+        if (data.ads.length === 0) {
+          container.innerHTML = '<p class="text-gray-500">No ads yet. Create your first ad above.</p>';
+          return;
+        }
+
+        container.innerHTML = data.ads.map(ad => `
+          <div class="border border-gray-200 rounded-lg p-4 flex gap-4 items-center">
+            <img src="${ad.image_url || ''}" alt="${ad.title}" class="w-32 h-20 object-cover rounded-lg bg-gray-200">
+            <div class="flex-1">
+              <h3 class="font-semibold text-gray-800">${ad.title}</h3>
+              <p class="text-sm text-gray-500">${ad.description || ''}</p>
+              <div class="flex gap-2 mt-1">
+                ${ad.app_store_url ? '<span class="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">iOS</span>' : ''}
+                ${ad.play_store_url ? '<span class="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">Android</span>' : ''}
+                <span class="text-xs ${ad.is_active ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'} px-2 py-1 rounded">
+                  ${ad.is_active ? 'Active' : 'Inactive'}
+                </span>
+              </div>
+            </div>
+            <div class="flex gap-2">
+              <button onclick="editAd('${ad.id}')" class="text-purple-600 hover:text-purple-800 p-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path>
+                </svg>
+              </button>
+              <button onclick="toggleAd('${ad.id}', ${ad.is_active})" class="text-yellow-600 hover:text-yellow-800 p-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${ad.is_active ? 'M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636' : 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z'}"></path>
+                </svg>
+              </button>
+              <button onclick="deleteAd('${ad.id}')" class="text-red-600 hover:text-red-800 p-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) {
+        console.error('Failed to load ads:', e);
+      }
+    }
+
+    let currentAds = [];
+    async function editAd(id) {
+      try {
+        const res = await fetch(`${API_BASE}/admin/ads`, {
+          headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        const data = await res.json();
+        const ad = data.ads.find(a => a.id === id);
+        if (!ad) return;
+
+        document.getElementById('adId').value = ad.id;
+        document.getElementById('adTitle').value = ad.title;
+        document.getElementById('adDescription').value = ad.description || '';
+        document.getElementById('adAppStore').value = ad.app_store_url || '';
+        document.getElementById('adPlayStore').value = ad.play_store_url || '';
+        document.getElementById('adLinkUrl').value = ad.link_url || '';
+        document.getElementById('currentImage').textContent = ad.image_url ? 'Current: ' + ad.image_url.split('/').pop() : '';
+
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } catch (e) {
+        console.error('Failed to load ad:', e);
+      }
+    }
+
+    async function toggleAd(id, currentState) {
+      try {
+        await fetch(`${API_BASE}/admin/ads/${id}`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${authToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ is_active: currentState ? 0 : 1 })
+        });
+        loadAds();
+      } catch (e) {
+        console.error('Failed to toggle ad:', e);
+      }
+    }
+
+    async function deleteAd(id) {
+      if (!confirm('Are you sure you want to delete this ad?')) return;
+      try {
+        await fetch(`${API_BASE}/admin/ads/${id}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${authToken}` }
+        });
+        loadAds();
+      } catch (e) {
+        console.error('Failed to delete ad:', e);
+      }
+    }
+
+    function resetForm() {
+      document.getElementById('adForm').reset();
+      document.getElementById('adId').value = '';
+      document.getElementById('currentImage').textContent = '';
+    }
+
+    document.getElementById('adForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const id = document.getElementById('adId').value || 'ad_' + Date.now();
+      const imageFile = document.getElementById('adImage').files[0];
+
+      let imageUrl = null;
+
+      // Upload image if selected
+      if (imageFile) {
+        const formData = new FormData();
+        formData.append('file', imageFile);
+        formData.append('filename', id + '.' + imageFile.name.split('.').pop());
+
+        try {
+          const uploadRes = await fetch(`${API_BASE}/admin/upload`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${authToken}` },
+            body: formData
+          });
+          const uploadData = await uploadRes.json();
+          if (uploadData.url) {
+            imageUrl = uploadData.url;
+          }
+        } catch (e) {
+          alert('Failed to upload image');
+          return;
+        }
+      }
+
+      const adData = {
+        id,
+        title: document.getElementById('adTitle').value,
+        description: document.getElementById('adDescription').value,
+        app_store_url: document.getElementById('adAppStore').value,
+        play_store_url: document.getElementById('adPlayStore').value,
+        link_url: document.getElementById('adLinkUrl').value,
+        is_active: 1
+      };
+
+      if (imageUrl) {
+        adData.image_url = imageUrl;
+      }
+
+      try {
+        const isEdit = document.getElementById('adId').value;
+        const res = await fetch(`${API_BASE}/admin/ads${isEdit ? '/' + id : ''}`, {
+          method: isEdit ? 'PUT' : 'POST',
+          headers: {
+            'Authorization': `Bearer ${authToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(adData)
+        });
+
+        if (res.ok) {
+          resetForm();
+          loadAds();
+        } else {
+          alert('Failed to save ad');
+        }
+      } catch (e) {
+        console.error('Failed to save ad:', e);
+        alert('Failed to save ad');
+      }
+    });
+  </script>
+</body>
+</html>

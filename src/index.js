@@ -103,7 +103,7 @@ export default {
               sdb: ['/sdb/login', '/sdb/refresh', '/sdb/rates', '/sdb/decrypt'],
               meta: ['/sources'],
               debug: ['/debug/telegram/ygea', '/debug/telegram/denko', '/debug/telegram/goldcurrency'],
-              admin: ['/admin/store-rates', '/admin/backfill?days=30'],
+              admin: ['/admin', '/admin/login', '/admin/ads', '/admin/upload', '/admin/store-rates', '/admin/backfill?days=30'],
               ads: ['/ads']
             },
             recommended: {
@@ -186,7 +186,28 @@ export default {
           return await getBestGoldPrices(env);
 
         case '/ads':
-          return await getAds(env);
+          return await getAdsFromDB(env);
+
+        case '/admin':
+          return await serveAdminDashboard();
+
+        case '/admin/login':
+          if (request.method === 'POST') {
+            return await adminLogin(request, env);
+          }
+          return jsonResponse({ error: 'Method not allowed' }, 405);
+
+        case '/admin/verify':
+          return await verifyAdminToken(request, env);
+
+        case '/admin/ads':
+          return await handleAdminAds(request, env);
+
+        case '/admin/upload':
+          if (request.method === 'POST') {
+            return await handleAdminUpload(request, env);
+          }
+          return jsonResponse({ error: 'Method not allowed' }, 405);
 
         default:
           // Handle dynamic routes
@@ -202,6 +223,13 @@ export default {
           if (adImageMatch) {
             const filename = adImageMatch[1];
             return await serveAdImage(env, filename);
+          }
+
+          // Admin ads CRUD by ID
+          const adminAdMatch = path.match(/^\/admin\/ads\/(.+)$/);
+          if (adminAdMatch) {
+            const adId = adminAdMatch[1];
+            return await handleAdminAdById(request, env, adId);
           }
 
           // Backfill endpoint to populate historical data
@@ -703,51 +731,6 @@ async function backfillHistoricalData(env, days = 30) {
  * Ads are stored in KV storage for easy management
  * To update ads: use /admin/ads endpoint (POST)
  */
-async function getAds(env) {
-  // Default ads configuration - edit these to change ads
-  const defaultAds = [
-    {
-      id: 'oo_marketplace',
-      title: 'OO Marketplace',
-      description: 'Shop smart, shop local',
-      imageUrl: 'https://mm-price-api.mmpriceapi.workers.dev/ads/oo-marketplace-banner.png',
-      linkUrl: null, // Will be set based on platform in app
-      appStoreUrl: 'https://apps.apple.com/app/oo-marketplace/id123456789',
-      playStoreUrl: 'https://play.google.com/store/apps/details?id=com.oomarketplace.app',
-      isActive: true
-    }
-  ];
-
-  try {
-    // Try to get ads from KV storage first
-    if (env?.ADS_CACHE) {
-      const cachedAds = await env.ADS_CACHE.get('active_ads', { type: 'json' });
-      if (cachedAds && cachedAds.length > 0) {
-        return jsonResponse({
-          ads: cachedAds,
-          source: 'cache',
-          timestamp: new Date().toISOString()
-        });
-      }
-    }
-
-    // Return default ads
-    return jsonResponse({
-      ads: defaultAds,
-      source: 'default',
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    return jsonResponse({
-      ads: defaultAds,
-      source: 'fallback',
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-}
-
 // Serve ad images from R2 storage
 async function serveAdImage(env, filename) {
   try {
@@ -780,6 +763,324 @@ async function serveAdImage(env, filename) {
     return new Response(object.body, { headers });
   } catch (error) {
     return new Response(`Error serving image: ${error.message}`, { status: 500 });
+  }
+}
+
+// Admin Dashboard HTML
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MM Price Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <div id="loginModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div class="bg-white rounded-xl p-8 w-96 shadow-2xl">
+      <h2 class="text-2xl font-bold text-gray-800 mb-6 text-center">Admin Login</h2>
+      <input type="password" id="adminPassword" placeholder="Enter admin password"
+        class="w-full px-4 py-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500">
+      <button onclick="login()" class="w-full gradient-bg text-white py-3 rounded-lg font-semibold hover:opacity-90 transition">Login</button>
+      <p id="loginError" class="text-red-500 text-sm mt-2 hidden">Invalid password</p>
+    </div>
+  </div>
+  <div id="mainContent" class="hidden">
+    <header class="gradient-bg text-white py-6 px-8 shadow-lg">
+      <div class="max-w-6xl mx-auto flex justify-between items-center">
+        <h1 class="text-2xl font-bold">MM Price Admin</h1>
+        <button onclick="logout()" class="bg-white bg-opacity-20 px-4 py-2 rounded-lg hover:bg-opacity-30 transition">Logout</button>
+      </div>
+    </header>
+    <main class="max-w-6xl mx-auto py-8 px-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+        <div class="bg-white rounded-xl p-6 shadow-md">
+          <h3 class="text-gray-500 text-sm">Total Ads</h3>
+          <p id="totalAds" class="text-3xl font-bold text-gray-800">0</p>
+        </div>
+        <div class="bg-white rounded-xl p-6 shadow-md">
+          <h3 class="text-gray-500 text-sm">Active Ads</h3>
+          <p id="activeAds" class="text-3xl font-bold text-green-600">0</p>
+        </div>
+      </div>
+      <div class="bg-white rounded-xl p-6 shadow-md mb-8">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">Add / Edit Banner Ad</h2>
+        <form id="adForm" class="space-y-4">
+          <input type="hidden" id="adId">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Title *</label>
+              <input type="text" id="adTitle" required class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
+              <input type="text" id="adDescription" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500">
+            </div>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Banner Image</label>
+            <div class="flex gap-4">
+              <input type="file" id="adImage" accept="image/*" class="flex-1 px-4 py-2 border border-gray-300 rounded-lg">
+              <span id="currentImage" class="text-sm text-gray-500 self-center"></span>
+            </div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">App Store URL (iOS)</label>
+              <input type="url" id="adAppStore" placeholder="https://apps.apple.com/..." class="w-full px-4 py-2 border border-gray-300 rounded-lg">
+            </div>
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-1">Play Store URL (Android)</label>
+              <input type="url" id="adPlayStore" placeholder="https://play.google.com/..." class="w-full px-4 py-2 border border-gray-300 rounded-lg">
+            </div>
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">External Link URL (optional)</label>
+            <input type="url" id="adLinkUrl" placeholder="https://..." class="w-full px-4 py-2 border border-gray-300 rounded-lg">
+          </div>
+          <div class="flex gap-4">
+            <button type="submit" class="gradient-bg text-white px-6 py-2 rounded-lg font-semibold hover:opacity-90 transition">Save Ad</button>
+            <button type="button" onclick="resetForm()" class="bg-gray-200 text-gray-700 px-6 py-2 rounded-lg font-semibold hover:bg-gray-300 transition">Cancel</button>
+          </div>
+        </form>
+      </div>
+      <div class="bg-white rounded-xl p-6 shadow-md">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">All Ads</h2>
+        <div id="adsList" class="space-y-4"><p class="text-gray-500">Loading ads...</p></div>
+      </div>
+    </main>
+  </div>
+  <script>
+    const API_BASE='';let authToken=localStorage.getItem('adminToken');if(authToken)verifyToken();
+    async function login(){const password=document.getElementById('adminPassword').value;try{const res=await fetch(API_BASE+'/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const data=await res.json();if(data.success){authToken=data.token;localStorage.setItem('adminToken',authToken);showDashboard()}else{document.getElementById('loginError').classList.remove('hidden')}}catch(e){document.getElementById('loginError').classList.remove('hidden')}}
+    async function verifyToken(){try{const res=await fetch(API_BASE+'/admin/verify',{headers:{'Authorization':'Bearer '+authToken}});if(res.ok)showDashboard();else logout()}catch(e){logout()}}
+    function showDashboard(){document.getElementById('loginModal').classList.add('hidden');document.getElementById('mainContent').classList.remove('hidden');loadAds()}
+    function logout(){localStorage.removeItem('adminToken');authToken=null;document.getElementById('loginModal').classList.remove('hidden');document.getElementById('mainContent').classList.add('hidden')}
+    async function loadAds(){try{const res=await fetch(API_BASE+'/admin/ads',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();document.getElementById('totalAds').textContent=data.ads.length;document.getElementById('activeAds').textContent=data.ads.filter(a=>a.is_active).length;const container=document.getElementById('adsList');if(data.ads.length===0){container.innerHTML='<p class="text-gray-500">No ads yet.</p>';return}container.innerHTML=data.ads.map(ad=>'<div class="border border-gray-200 rounded-lg p-4 flex gap-4 items-center"><img src="'+(ad.image_url||'')+'" alt="'+ad.title+'" class="w-32 h-20 object-cover rounded-lg bg-gray-200"><div class="flex-1"><h3 class="font-semibold text-gray-800">'+ad.title+'</h3><p class="text-sm text-gray-500">'+(ad.description||'')+'</p><div class="flex gap-2 mt-1">'+(ad.app_store_url?'<span class="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">iOS</span>':'')+(ad.play_store_url?'<span class="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">Android</span>':'')+'<span class="text-xs '+(ad.is_active?'bg-green-100 text-green-700':'bg-red-100 text-red-700')+' px-2 py-1 rounded">'+(ad.is_active?'Active':'Inactive')+'</span></div></div><div class="flex gap-2"><button onclick="editAd(\\''+ad.id+'\\')\" class="text-purple-600 hover:text-purple-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button><button onclick="toggleAd(\\''+ad.id+'\\','+ad.is_active+')" class="text-yellow-600 hover:text-yellow-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="'+(ad.is_active?'M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636':'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z')+'"></path></svg></button><button onclick="deleteAd(\\''+ad.id+'\\')\" class="text-red-600 hover:text-red-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button></div></div>').join('')}catch(e){console.error(e)}}
+    async function editAd(id){try{const res=await fetch(API_BASE+'/admin/ads',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();const ad=data.ads.find(a=>a.id===id);if(!ad)return;document.getElementById('adId').value=ad.id;document.getElementById('adTitle').value=ad.title;document.getElementById('adDescription').value=ad.description||'';document.getElementById('adAppStore').value=ad.app_store_url||'';document.getElementById('adPlayStore').value=ad.play_store_url||'';document.getElementById('adLinkUrl').value=ad.link_url||'';document.getElementById('currentImage').textContent=ad.image_url?'Current: '+ad.image_url.split('/').pop():'';window.scrollTo({top:0,behavior:'smooth'})}catch(e){console.error(e)}}
+    async function toggleAd(id,state){try{await fetch(API_BASE+'/admin/ads/'+id,{method:'PUT',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({is_active:state?0:1})});loadAds()}catch(e){console.error(e)}}
+    async function deleteAd(id){if(!confirm('Delete this ad?'))return;try{await fetch(API_BASE+'/admin/ads/'+id,{method:'DELETE',headers:{'Authorization':'Bearer '+authToken}});loadAds()}catch(e){console.error(e)}}
+    function resetForm(){document.getElementById('adForm').reset();document.getElementById('adId').value='';document.getElementById('currentImage').textContent=''}
+    document.getElementById('adForm').addEventListener('submit',async e=>{e.preventDefault();const id=document.getElementById('adId').value||'ad_'+Date.now();const imageFile=document.getElementById('adImage').files[0];let imageUrl=null;if(imageFile){const formData=new FormData();formData.append('file',imageFile);formData.append('filename',id+'.'+imageFile.name.split('.').pop());try{const uploadRes=await fetch(API_BASE+'/admin/upload',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:formData});const uploadData=await uploadRes.json();if(uploadData.url)imageUrl=uploadData.url}catch(e){alert('Upload failed');return}}const adData={id,title:document.getElementById('adTitle').value,description:document.getElementById('adDescription').value,app_store_url:document.getElementById('adAppStore').value,play_store_url:document.getElementById('adPlayStore').value,link_url:document.getElementById('adLinkUrl').value,is_active:1};if(imageUrl)adData.image_url=imageUrl;try{const isEdit=document.getElementById('adId').value;const res=await fetch(API_BASE+'/admin/ads'+(isEdit?'/'+id:''),{method:isEdit?'PUT':'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify(adData)});if(res.ok){resetForm();loadAds()}else alert('Save failed')}catch(e){console.error(e);alert('Save failed')}});
+  </script>
+</body>
+</html>`;
+
+// Serve admin dashboard
+async function serveAdminDashboard() {
+  return new Response(ADMIN_HTML, {
+    headers: {
+      'Content-Type': 'text/html',
+      ...corsHeaders
+    }
+  });
+}
+
+// Generate simple token
+function generateToken(password) {
+  const payload = { p: password, t: Date.now() };
+  return btoa(JSON.stringify(payload));
+}
+
+// Verify token
+function verifyToken(token, adminPassword) {
+  try {
+    const payload = JSON.parse(atob(token));
+    // Token valid for 24 hours
+    if (Date.now() - payload.t > 24 * 60 * 60 * 1000) return false;
+    return payload.p === adminPassword;
+  } catch {
+    return false;
+  }
+}
+
+// Admin login
+async function adminLogin(request, env) {
+  const adminPassword = env.ADMIN_PASSWORD || 'admin123';
+  try {
+    const { password } = await request.json();
+    if (password === adminPassword) {
+      const token = generateToken(password);
+      return jsonResponse({ success: true, token });
+    }
+    return jsonResponse({ success: false, error: 'Invalid password' }, 401);
+  } catch {
+    return jsonResponse({ success: false, error: 'Invalid request' }, 400);
+  }
+}
+
+// Verify admin token endpoint
+async function verifyAdminToken(request, env) {
+  const adminPassword = env.ADMIN_PASSWORD || 'admin123';
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return jsonResponse({ valid: false }, 401);
+  }
+  const token = authHeader.slice(7);
+  if (verifyToken(token, adminPassword)) {
+    return jsonResponse({ valid: true });
+  }
+  return jsonResponse({ valid: false }, 401);
+}
+
+// Check admin auth middleware
+function checkAdminAuth(request, env) {
+  const adminPassword = env.ADMIN_PASSWORD || 'admin123';
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return false;
+  }
+  return verifyToken(authHeader.slice(7), adminPassword);
+}
+
+// Handle admin ads list/create
+async function handleAdminAds(request, env) {
+  if (!checkAdminAuth(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  if (request.method === 'GET') {
+    // List all ads
+    const result = await env.DB.prepare(
+      'SELECT * FROM ads ORDER BY display_order ASC, created_at DESC'
+    ).all();
+    return jsonResponse({ ads: result.results || [] });
+  }
+
+  if (request.method === 'POST') {
+    // Create new ad
+    const data = await request.json();
+    const id = data.id || 'ad_' + Date.now();
+
+    await env.DB.prepare(`
+      INSERT INTO ads (id, title, description, image_url, link_url, app_store_url, play_store_url, is_active, display_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      data.title,
+      data.description || null,
+      data.image_url || null,
+      data.link_url || null,
+      data.app_store_url || null,
+      data.play_store_url || null,
+      data.is_active !== undefined ? data.is_active : 1,
+      data.display_order || 0
+    ).run();
+
+    return jsonResponse({ success: true, id });
+  }
+
+  return jsonResponse({ error: 'Method not allowed' }, 405);
+}
+
+// Handle admin ads by ID (update/delete)
+async function handleAdminAdById(request, env, adId) {
+  if (!checkAdminAuth(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  if (request.method === 'PUT') {
+    const data = await request.json();
+    const updates = [];
+    const values = [];
+
+    if (data.title !== undefined) { updates.push('title = ?'); values.push(data.title); }
+    if (data.description !== undefined) { updates.push('description = ?'); values.push(data.description); }
+    if (data.image_url !== undefined) { updates.push('image_url = ?'); values.push(data.image_url); }
+    if (data.link_url !== undefined) { updates.push('link_url = ?'); values.push(data.link_url); }
+    if (data.app_store_url !== undefined) { updates.push('app_store_url = ?'); values.push(data.app_store_url); }
+    if (data.play_store_url !== undefined) { updates.push('play_store_url = ?'); values.push(data.play_store_url); }
+    if (data.is_active !== undefined) { updates.push('is_active = ?'); values.push(data.is_active); }
+    if (data.display_order !== undefined) { updates.push('display_order = ?'); values.push(data.display_order); }
+
+    updates.push('updated_at = ?');
+    values.push(new Date().toISOString());
+    values.push(adId);
+
+    await env.DB.prepare(
+      `UPDATE ads SET ${updates.join(', ')} WHERE id = ?`
+    ).bind(...values).run();
+
+    return jsonResponse({ success: true });
+  }
+
+  if (request.method === 'DELETE') {
+    await env.DB.prepare('DELETE FROM ads WHERE id = ?').bind(adId).run();
+    return jsonResponse({ success: true });
+  }
+
+  return jsonResponse({ error: 'Method not allowed' }, 405);
+}
+
+// Handle image upload to R2
+async function handleAdminUpload(request, env) {
+  if (!checkAdminAuth(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const formData = await request.formData();
+    const file = formData.get('file');
+    const filename = formData.get('filename') || file.name;
+
+    if (!file) {
+      return jsonResponse({ error: 'No file provided' }, 400);
+    }
+
+    // Upload to R2
+    await env.AD_IMAGES.put(filename, file.stream(), {
+      httpMetadata: {
+        contentType: file.type
+      }
+    });
+
+    const url = `https://mm-price-api.mmpriceapi.workers.dev/ads/${filename}`;
+    return jsonResponse({ success: true, url, filename });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Get ads from database (public endpoint)
+async function getAdsFromDB(env) {
+  try {
+    const result = await env.DB.prepare(
+      'SELECT * FROM ads WHERE is_active = 1 ORDER BY display_order ASC'
+    ).all();
+
+    const ads = (result.results || []).map(ad => ({
+      id: ad.id,
+      title: ad.title,
+      description: ad.description,
+      imageUrl: ad.image_url,
+      linkUrl: ad.link_url,
+      appStoreUrl: ad.app_store_url,
+      playStoreUrl: ad.play_store_url,
+      isActive: ad.is_active === 1
+    }));
+
+    return jsonResponse({
+      ads,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    // Fallback to hardcoded ads
+    return jsonResponse({
+      ads: [{
+        id: 'oo_marketplace',
+        title: 'OO Marketplace',
+        description: 'Shop smart, shop local',
+        imageUrl: 'https://mm-price-api.mmpriceapi.workers.dev/ads/oo-marketplace-banner.png',
+        appStoreUrl: 'https://apps.apple.com/app/oo-marketplace/id123456789',
+        playStoreUrl: 'https://play.google.com/store/apps/details?id=com.oomarketplace.app',
+        isActive: true
+      }],
+      source: 'fallback',
+      timestamp: new Date().toISOString()
+    });
   }
 }
 
