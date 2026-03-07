@@ -1,0 +1,17 @@
+name = "mm-price-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Workers AI for OCR
+[ai]
+binding = "AI"
+
+# KV Storage for caching parsed prices (optional)
+# [[kv_namespaces]]
+# binding = "PRICE_CACHE"
+# id = "your-kv-namespace-id"
+
+# Optional: Add your custom domain later
+# routes = [
+#   { pattern = "api.yourdomain.com/*", zone_name = "yourdomain.com" }
+# ]

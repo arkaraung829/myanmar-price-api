@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Wrangler
+.wrangler/
+
+# Sensitive keys - DO NOT COMMIT
+*.pem
+sdb-private-key.pem
+sdb-public-key.pem
+
+# Local test scripts with credentials
+decrypt-sdb*.js
+test-sdb*.js
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
