@@ -103,7 +103,8 @@ export default {
               sdb: ['/sdb/login', '/sdb/refresh', '/sdb/rates', '/sdb/decrypt'],
               meta: ['/sources'],
               debug: ['/debug/telegram/ygea', '/debug/telegram/denko', '/debug/telegram/goldcurrency'],
-              admin: ['/admin/store-rates', '/admin/backfill?days=30']
+              admin: ['/admin/store-rates', '/admin/backfill?days=30'],
+              ads: ['/ads']
             },
             recommended: {
               gold: '/gold/live - Real-time from @goldcurrencyupdate (TEXT)',
@@ -183,6 +184,9 @@ export default {
 
         case '/gold/best':
           return await getBestGoldPrices(env);
+
+        case '/ads':
+          return await getAds(env);
 
         default:
           // Handle dynamic routes
@@ -681,6 +685,60 @@ async function backfillHistoricalData(env, days = 30) {
     details: results,
     timestamp: new Date().toISOString()
   });
+}
+
+// ============================================================
+// ADS MANAGEMENT
+// ============================================================
+
+/**
+ * Get ads for the app
+ * Ads are stored in KV storage for easy management
+ * To update ads: use /admin/ads endpoint (POST)
+ */
+async function getAds(env) {
+  // Default ads configuration - edit these to change ads
+  const defaultAds = [
+    {
+      id: 'oo_marketplace',
+      title: 'OO Marketplace',
+      description: 'Shop smart, shop local',
+      imageUrl: 'https://mm-price-api.mmpriceapi.workers.dev/static/oo-marketplace-banner.png',
+      linkUrl: null, // Will be set based on platform in app
+      appStoreUrl: 'https://apps.apple.com/app/oo-marketplace/id123456789',
+      playStoreUrl: 'https://play.google.com/store/apps/details?id=com.oomarketplace.app',
+      isActive: true
+    }
+  ];
+
+  try {
+    // Try to get ads from KV storage first
+    if (env?.ADS_CACHE) {
+      const cachedAds = await env.ADS_CACHE.get('active_ads', { type: 'json' });
+      if (cachedAds && cachedAds.length > 0) {
+        return jsonResponse({
+          ads: cachedAds,
+          source: 'cache',
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
+    // Return default ads
+    return jsonResponse({
+      ads: defaultAds,
+      source: 'default',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      ads: defaultAds,
+      source: 'fallback',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 }
 
 // Get gold prices from MarketPricePro
