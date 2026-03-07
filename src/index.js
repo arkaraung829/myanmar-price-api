@@ -98,7 +98,7 @@ export default {
             endpoints: {
               currency: ['/currency', '/currency/official', '/currency/sdb'],
               gold: ['/gold', '/gold/live', '/gold/best', '/gold/telegram', '/gold/ocr'],
-              fuel: ['/fuel'],
+              fuel: ['/fuel', '/fuel/live', '/fuel/best'],
               combined: ['/all'],
               sdb: ['/sdb/login', '/sdb/refresh', '/sdb/rates', '/sdb/decrypt'],
               meta: ['/sources'],
@@ -107,7 +107,8 @@ export default {
             recommended: {
               gold: '/gold/live - Real-time from @goldcurrencyupdate (TEXT)',
               goldBest: '/gold/best - Auto-selects best available source',
-              currency: '/sdb/rates - Auto-login to SDB for real-time rates'
+              currency: '/sdb/rates - Auto-login to SDB for real-time rates',
+              fuel: '/fuel/best - OCR from @DenkoTrading or MarketPricePro fallback'
             },
             dataSources: {
               primary: '@goldcurrencyupdate (TEXT - no OCR needed)',
@@ -151,6 +152,12 @@ export default {
 
         case '/fuel':
           return await getFuelPrices();
+
+        case '/fuel/live':
+          return await getFuelFromTelegram(env);
+
+        case '/fuel/best':
+          return await getBestFuelPrices(env);
 
         case '/all':
           return await getAllPrices();
@@ -731,7 +738,7 @@ async function getSourcesStatus() {
  * OCR: Extract text from image using Workers AI
  * Requires AI binding in wrangler.toml
  */
-async function extractTextFromImage(imageUrl, ai) {
+async function extractTextFromImage(imageUrl, ai, customPrompt = null) {
   if (!ai) {
     return { success: false, error: 'Workers AI not configured' };
   }
@@ -741,10 +748,12 @@ async function extractTextFromImage(imageUrl, ai) {
     const imageResponse = await fetch(imageUrl);
     const imageBuffer = await imageResponse.arrayBuffer();
 
+    const defaultPrompt = 'Extract all numbers and prices from this image. List each price with its label.';
+
     // Use LLaVA model for image-to-text
     const result = await ai.run('@cf/llava-hf/llava-1.5-7b-hf', {
       image: [...new Uint8Array(imageBuffer)],
-      prompt: 'Extract all numbers and prices from this image. List each price with its label.',
+      prompt: customPrompt || defaultPrompt,
       max_tokens: 512
     });
 
@@ -755,6 +764,23 @@ async function extractTextFromImage(imageUrl, ai) {
   } catch (error) {
     return { success: false, error: error.message };
   }
+}
+
+/**
+ * OCR: Extract fuel prices from image
+ * Specific prompt for fuel price tables
+ */
+async function extractFuelPricesFromImage(imageUrl, ai) {
+  const fuelPrompt = `This is a fuel price table from Myanmar. Extract the prices for:
+- Octane 92 (or 92 RON)
+- Octane 95 (or 95 RON)
+- Diesel (or HSD)
+- Premium Diesel (or Euro 5 or PHSD)
+
+List each fuel type with its price in numbers. Format: "Octane 92: XXXX, Diesel: XXXX"
+Only output the fuel names and numbers, nothing else.`;
+
+  return await extractTextFromImage(imageUrl, ai, fuelPrompt);
 }
 
 /**
@@ -1662,4 +1688,216 @@ async function getSDBRatesAuto(request, env) {
       message: error.message
     }, 500);
   }
+}
+
+// ============================================================
+// FUEL PRICES FROM TELEGRAM (OCR)
+// ============================================================
+
+/**
+ * Parse fuel prices from OCR text
+ * Expected format from Denko images:
+ * - Octane 92: X,XXX Ks
+ * - Octane 95: X,XXX Ks
+ * - Diesel: X,XXX Ks
+ * - Premium Diesel: X,XXX Ks
+ */
+function parseFuelPricesFromOCR(text) {
+  const prices = {};
+
+  // Common patterns for fuel prices
+  const patterns = [
+    // Octane 92
+    { name: 'Octane 92', regex: /(?:octane\s*92|92\s*(?:ron|octane)?)[:\s-]*([0-9,]+)/gi },
+    { name: 'Octane 92', regex: /92[:\s]*([0-9,]+)\s*(?:ks|kyat|ကျပ်)/gi },
+    // Octane 95
+    { name: 'Octane 95', regex: /(?:octane\s*95|95\s*(?:ron|octane)?)[:\s-]*([0-9,]+)/gi },
+    { name: 'Octane 95', regex: /95[:\s]*([0-9,]+)\s*(?:ks|kyat|ကျပ်)/gi },
+    // Diesel
+    { name: 'Diesel', regex: /(?:diesel|ဒီဇယ်)[:\s-]*([0-9,]+)/gi },
+    { name: 'Diesel', regex: /(?:HSD|high\s*speed\s*diesel)[:\s-]*([0-9,]+)/gi },
+    // Premium Diesel
+    { name: 'Premium Diesel', regex: /(?:premium\s*diesel|euro\s*5)[:\s-]*([0-9,]+)/gi },
+    { name: 'Premium Diesel', regex: /(?:PHSD|premium\s*HSD)[:\s-]*([0-9,]+)/gi }
+  ];
+
+  for (const { name, regex } of patterns) {
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const priceStr = match[1].replace(/,/g, '');
+      const price = parseInt(priceStr, 10);
+      // Valid fuel price range: 1000-20000 MMK/liter
+      if (price >= 1000 && price <= 20000) {
+        prices[name] = price;
+      }
+    }
+  }
+
+  return prices;
+}
+
+/**
+ * Get fuel prices from DenkoTrading Telegram with OCR
+ */
+async function getFuelFromTelegram(env) {
+  // Check if Workers AI is configured
+  if (!env?.AI) {
+    return jsonResponse({
+      error: 'Workers AI not configured',
+      message: 'OCR requires AI binding in wrangler.toml',
+      fallback: 'Use /fuel for MarketPricePro data'
+    }, 503);
+  }
+
+  try {
+    // Fetch DenkoTrading channel
+    const telegramResult = await fetchTelegramPublic(TELEGRAM_CHANNELS.DENKO);
+
+    if (!telegramResult.success) {
+      return await getFuelPrices(); // Fallback to MarketPricePro
+    }
+
+    // Get the latest image
+    const images = telegramResult.images?.filter(img =>
+      img.includes('telesco.pe') || img.includes('telegram.org/file')
+    ) || [];
+
+    if (images.length === 0) {
+      return jsonResponse({
+        error: 'No fuel price images found',
+        channel: '@DenkoTrading',
+        fallback: 'Use /fuel for MarketPricePro data'
+      }, 404);
+    }
+
+    // Process first image with OCR using fuel-specific prompt
+    const imageUrl = images[0];
+    const ocrResult = await extractFuelPricesFromImage(imageUrl, env.AI);
+
+    if (!ocrResult.success) {
+      return jsonResponse({
+        error: 'OCR failed',
+        message: ocrResult.error,
+        fallback: 'Use /fuel for MarketPricePro data'
+      }, 500);
+    }
+
+    // Parse fuel prices from OCR text
+    const prices = parseFuelPricesFromOCR(ocrResult.text);
+
+    // Extract date from messages
+    let date = null;
+    for (const msg of telegramResult.messages) {
+      const dateMatch = msg.match(/(\d{1,2}\.\d{1,2}\.2026)/);
+      if (dateMatch) {
+        date = dateMatch[1];
+        break;
+      }
+    }
+
+    if (Object.keys(prices).length > 0) {
+      return jsonResponse({
+        source: 'Telegram',
+        channel: '@DenkoTrading',
+        method: 'ocr',
+        date,
+        prices: {
+          'Octane 92': prices['Octane 92'] ? {
+            price: prices['Octane 92'],
+            formatted: prices['Octane 92'].toLocaleString() + ' MMK/L'
+          } : null,
+          'Octane 95': prices['Octane 95'] ? {
+            price: prices['Octane 95'],
+            formatted: prices['Octane 95'].toLocaleString() + ' MMK/L'
+          } : null,
+          'Diesel': prices['Diesel'] ? {
+            price: prices['Diesel'],
+            formatted: prices['Diesel'].toLocaleString() + ' MMK/L'
+          } : null,
+          'Premium Diesel': prices['Premium Diesel'] ? {
+            price: prices['Premium Diesel'],
+            formatted: prices['Premium Diesel'].toLocaleString() + ' MMK/L'
+          } : null
+        },
+        ocrText: ocrResult.text,
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // If no prices parsed, return OCR text for debugging
+    return jsonResponse({
+      source: 'Telegram',
+      channel: '@DenkoTrading',
+      method: 'ocr',
+      warning: 'Could not parse fuel prices from OCR',
+      ocrText: ocrResult.text,
+      imageUrl,
+      fallback: 'Use /fuel for MarketPricePro data',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    return jsonResponse({
+      error: 'Failed to fetch fuel prices',
+      message: error.message
+    }, 500);
+  }
+}
+
+/**
+ * Get best available fuel prices
+ * Priority: DenkoTrading OCR > MarketPricePro
+ */
+async function getBestFuelPrices(env) {
+  // Try Telegram OCR first if AI is available
+  if (env?.AI) {
+    try {
+      const telegramResult = await fetchTelegramPublic(TELEGRAM_CHANNELS.DENKO);
+
+      if (telegramResult.success && telegramResult.images?.length > 0) {
+        const images = telegramResult.images.filter(img =>
+          img.includes('telesco.pe') || img.includes('telegram.org/file')
+        );
+
+        if (images.length > 0) {
+          const ocrResult = await extractFuelPricesFromImage(images[0], env.AI);
+
+          if (ocrResult.success) {
+            const prices = parseFuelPricesFromOCR(ocrResult.text);
+
+            if (Object.keys(prices).length > 0) {
+              // Extract date
+              let date = null;
+              for (const msg of telegramResult.messages) {
+                const dateMatch = msg.match(/(\d{1,2}\.\d{1,2}\.2026)/);
+                if (dateMatch) {
+                  date = dateMatch[1];
+                  break;
+                }
+              }
+
+              return jsonResponse({
+                source: 'Telegram',
+                channel: '@DenkoTrading',
+                method: 'ocr',
+                date,
+                prices: Object.fromEntries(
+                  Object.entries(prices).map(([name, price]) => [
+                    name,
+                    { price, formatted: price.toLocaleString() + ' MMK/L' }
+                  ])
+                ),
+                timestamp: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Fall through to MarketPricePro
+    }
+  }
+
+  // Fallback to MarketPricePro
+  return await getFuelPrices();
 }
