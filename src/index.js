@@ -124,7 +124,7 @@ export default {
           });
 
         case '/currency':
-          return await getMarketCurrency();
+          return await getCurrencyWithSDBPrimary(env);
 
         case '/currency/official':
           return await getOfficialCurrency();
@@ -203,6 +203,171 @@ async function getOfficialCurrency() {
     rates: data.rates,
     timestamp: new Date().toISOString()
   });
+}
+
+// Get currency rates with SDB as primary, MMP as fallback
+async function getCurrencyWithSDBPrimary(env) {
+  try {
+    // Try SDB first (requires SDB_EMAIL and SDB_PASSWORD env vars)
+    const email = env?.SDB_EMAIL;
+    const password = env?.SDB_PASSWORD;
+
+    if (!email || !password) {
+      // No SDB credentials, fall back to MMP
+      return await getMarketCurrency();
+    }
+
+    let accessToken;
+    let tokenSource = 'fresh_login';
+
+    // Check for cached token in KV
+    if (env?.SDB_TOKEN_CACHE) {
+      const cachedToken = await env.SDB_TOKEN_CACHE.get('sdb_access_token');
+      if (cachedToken) {
+        accessToken = cachedToken;
+        tokenSource = 'cached';
+      }
+    }
+
+    // If no cached token, login to get new one
+    if (!accessToken) {
+      const encryptedPayload = await encryptJWE({ email, password });
+
+      const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ encrypt: encryptedPayload })
+      });
+
+      if (!loginResponse.ok) {
+        // SDB login failed, fall back to MMP
+        return await getMarketCurrency();
+      }
+
+      const loginData = await loginResponse.json();
+
+      if (loginData.encrypt) {
+        const decrypted = await decryptJWE(loginData.encrypt);
+        const parsedLogin = JSON.parse(decrypted);
+        accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
+      } else {
+        accessToken = loginData.data?.access_token || loginData.accessToken;
+      }
+
+      if (!accessToken) {
+        return await getMarketCurrency();
+      }
+
+      // Cache the token for 9 minutes
+      if (env?.SDB_TOKEN_CACHE) {
+        await env.SDB_TOKEN_CACHE.put('sdb_access_token', accessToken, { expirationTtl: 540 });
+      }
+    }
+
+    // Fetch exchange rates from SDB
+    let ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Accept': 'application/json'
+      }
+    });
+
+    // If token expired, clear cache and retry
+    if (ratesResponse.status === 401 && tokenSource === 'cached') {
+      if (env?.SDB_TOKEN_CACHE) {
+        await env.SDB_TOKEN_CACHE.delete('sdb_access_token');
+      }
+
+      // Login again
+      const encryptedPayload = await encryptJWE({ email, password });
+      const loginResponse = await fetch(`${SDB_API_URL}/v1/auth/login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ encrypt: encryptedPayload })
+      });
+
+      if (!loginResponse.ok) {
+        return await getMarketCurrency();
+      }
+
+      const loginData = await loginResponse.json();
+      if (loginData.encrypt) {
+        const decrypted = await decryptJWE(loginData.encrypt);
+        const parsedLogin = JSON.parse(decrypted);
+        accessToken = parsedLogin.data?.access_token || parsedLogin.accessToken;
+      }
+
+      if (env?.SDB_TOKEN_CACHE && accessToken) {
+        await env.SDB_TOKEN_CACHE.put('sdb_access_token', accessToken, { expirationTtl: 540 });
+      }
+
+      ratesResponse = await fetch(`${SDB_API_URL}/v1/dashboard/summary`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Accept': 'application/json'
+        }
+      });
+
+      tokenSource = 'refreshed';
+    }
+
+    if (!ratesResponse.ok) {
+      return await getMarketCurrency();
+    }
+
+    const ratesData = await ratesResponse.json();
+
+    if (!ratesData.encrypt) {
+      return await getMarketCurrency();
+    }
+
+    const decrypted = await decryptJWE(ratesData.encrypt);
+    const parsed = JSON.parse(decrypted);
+    const ratesObj = parsed.data || parsed;
+
+    // Extract exchange rates
+    const rates = {};
+    const exchangeRatesData = ratesObj.exchange_rates?.rates || [];
+
+    for (const rate of exchangeRatesData) {
+      const code = rate.base_currency?.code;
+      const buyRate = parseFloat(rate.buy_rate);
+      const sellRate = parseFloat(rate.sell_rate);
+
+      if (code && code !== 'GOLD' && code !== 'SDB') {
+        rates[code] = {
+          name: rate.base_currency?.name,
+          buy: buyRate.toFixed(2),
+          sell: sellRate.toFixed(2),
+          buyFormatted: buyRate.toFixed(2) + ' MMK',
+          sellFormatted: sellRate.toFixed(2) + ' MMK'
+        };
+      }
+    }
+
+    const lastUpdated = ratesObj.exchange_rates?.last_updated_at;
+
+    return jsonResponse({
+      source: 'Spring Development Bank',
+      type: 'bank_rate',
+      tokenSource,
+      lastUpdated,
+      rates,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    // Any error, fall back to MMP
+    return await getMarketCurrency();
+  }
 }
 
 // Get market exchange rates from MarketPricePro
