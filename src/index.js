@@ -96,7 +96,7 @@ export default {
             message: 'Myanmar Price API',
             version: '1.5.0',
             endpoints: {
-              currency: ['/currency', '/currency/official', '/currency/sdb'],
+              currency: ['/currency', '/currency/official', '/currency/sdb', '/currency/history/:code'],
               gold: ['/gold', '/gold/live', '/gold/best', '/gold/telegram', '/gold/ocr'],
               fuel: ['/fuel', '/fuel/live', '/fuel/best'],
               combined: ['/all'],
@@ -184,6 +184,14 @@ export default {
           return await getBestGoldPrices(env);
 
         default:
+          // Handle dynamic routes
+          const currencyHistoryMatch = path.match(/^\/currency\/history\/([A-Z]{3})$/);
+          if (currencyHistoryMatch) {
+            const code = currencyHistoryMatch[1];
+            const days = parseInt(url.searchParams.get('days') || '7', 10);
+            return await getCurrencyHistory(code, Math.min(Math.max(days, 1), 90));
+          }
+
           return jsonResponse({ error: 'Not found' }, 404);
       }
     } catch (error) {
@@ -414,6 +422,88 @@ async function getMarketCurrency() {
     source: 'Market Rate',
     type: 'market',
     rates,
+    timestamp: new Date().toISOString()
+  });
+}
+
+// Get historical currency rates for a specific currency
+async function getCurrencyHistory(code, days = 7) {
+  const history = [];
+  const today = new Date();
+
+  // Fetch data for each day in parallel (batch of 10 to avoid rate limiting)
+  const batchSize = 10;
+  const dates = [];
+
+  for (let i = 0; i < days; i++) {
+    const date = new Date(today);
+    date.setDate(date.getDate() - i);
+    dates.push(date.toISOString().split('T')[0]);
+  }
+
+  // Process dates in batches
+  for (let i = 0; i < dates.length; i += batchSize) {
+    const batch = dates.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (dateStr) => {
+        try {
+          const response = await fetch(
+            `https://api.marketpricepro.com/users/home_content/data?is_today=false&category_id=102&date=${dateStr}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${MMP_TOKEN}`,
+                'country': 'MM',
+                'language': 'en',
+                'Accept': 'application/json'
+              }
+            }
+          );
+
+          if (!response.ok) {
+            return { date: dateStr, error: 'API error' };
+          }
+
+          const data = await response.json();
+
+          // Extract the specific currency rate
+          if (data.data && data.data[0] && data.data[0].sub_categories) {
+            const items = data.data[0].sub_categories[0].items || [];
+
+            // Find the currency and get the latest entry for that day
+            const currencyItems = items.filter(item => item.item_name === code);
+            if (currencyItems.length > 0) {
+              // Sort by created_at_date to get latest
+              currencyItems.sort((a, b) => b.created_at_date.localeCompare(a.created_at_date));
+              const item = currencyItems[0];
+              return {
+                date: dateStr,
+                buy: item.buy_price,
+                sell: item.sell_price
+              };
+            }
+          }
+
+          return { date: dateStr, buy: null, sell: null };
+        } catch (error) {
+          return { date: dateStr, error: error.message };
+        }
+      })
+    );
+
+    history.push(...results);
+  }
+
+  // Filter out entries with errors or null values
+  const validHistory = history.filter(h => h.buy !== null && h.sell !== null && !h.error);
+
+  // Sort by date descending (newest first)
+  validHistory.sort((a, b) => b.date.localeCompare(a.date));
+
+  return jsonResponse({
+    currency: code,
+    source: 'MarketPricePro',
+    days: days,
+    history: validHistory,
     timestamp: new Date().toISOString()
   });
 }
