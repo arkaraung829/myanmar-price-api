@@ -71,12 +71,70 @@ const TELEGRAM_CHANNELS = {
 // Cache duration in seconds
 const CACHE_DURATION = 600; // 10 minutes
 
+// International exchange rate API for cross-rate calculations
+const EXCHANGE_RATE_API = 'https://api.exchangerate-api.com/v4/latest/USD';
+
+// Currencies to calculate from USD cross-rate (not available from SDB)
+const CALCULATED_CURRENCIES = {
+  CAD: { name: 'Canadian Dollar' }
+};
+
 // CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
+
+// Fetch international exchange rates for cross-rate calculations
+async function getInternationalRates() {
+  try {
+    const response = await fetch(EXCHANGE_RATE_API, {
+      headers: { 'Accept': 'application/json' }
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.rates || null;
+  } catch (error) {
+    console.error('Failed to fetch international rates:', error);
+    return null;
+  }
+}
+
+// Add calculated currencies using USD cross-rate
+async function addCalculatedCurrencies(rates) {
+  if (!rates.USD) return rates;
+
+  const usdBuy = parseFloat(rates.USD.buy);
+  const usdSell = parseFloat(rates.USD.sell);
+
+  if (isNaN(usdBuy) || isNaN(usdSell)) return rates;
+
+  const intlRates = await getInternationalRates();
+  if (!intlRates) return rates;
+
+  for (const [code, info] of Object.entries(CALCULATED_CURRENCIES)) {
+    const intlRate = intlRates[code];
+    if (intlRate) {
+      // CAD/MMK = USD/MMK × (1 / USD/CAD) = USD/MMK / intlRate
+      const buyRate = usdBuy / intlRate;
+      const sellRate = usdSell / intlRate;
+
+      rates[code] = {
+        name: info.name,
+        buy: buyRate.toFixed(2),
+        sell: sellRate.toFixed(2),
+        buyFormatted: buyRate.toFixed(2) + ' MMK',
+        sellFormatted: sellRate.toFixed(2) + ' MMK',
+        calculated: true,
+        baseRate: 'USD',
+        crossRate: (1 / intlRate).toFixed(6)
+      };
+    }
+  }
+
+  return rates;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -419,12 +477,15 @@ async function getCurrencyWithSDBPrimary(env) {
 
     const lastUpdated = ratesObj.exchange_rates?.last_updated_at;
 
+    // Add calculated currencies (CAD, etc.) using USD cross-rate
+    const ratesWithCalculated = await addCalculatedCurrencies(rates);
+
     return jsonResponse({
       source: 'Spring Development Bank',
       type: 'bank_rate',
       tokenSource,
       lastUpdated,
-      rates,
+      rates: ratesWithCalculated,
       timestamp: new Date().toISOString()
     });
 
@@ -474,10 +535,13 @@ async function getMarketCurrency() {
     });
   }
 
+  // Add calculated currencies (CAD, etc.) using USD cross-rate
+  const ratesWithCalculated = await addCalculatedCurrencies(rates);
+
   return jsonResponse({
     source: 'Market Rate',
     type: 'market',
-    rates,
+    rates: ratesWithCalculated,
     timestamp: new Date().toISOString()
   });
 }
@@ -2154,10 +2218,13 @@ async function getSDBCurrency(request) {
       };
     }
 
+    // Add calculated currencies (CAD, etc.) using USD cross-rate
+    const ratesWithCalculated = await addCalculatedCurrencies(rates);
+
     return jsonResponse({
       source: 'Spring Development Bank',
       type: 'bank_rate',
-      rates,
+      rates: ratesWithCalculated,
       goldRate,
       timestamp: new Date().toISOString()
     });
@@ -2566,13 +2633,16 @@ async function getSDBRatesAuto(request, env) {
     // Get last updated timestamp
     const lastUpdated = ratesObj.exchange_rates?.last_updated_at;
 
+    // Add calculated currencies (CAD, etc.) using USD cross-rate
+    const ratesWithCalculated = await addCalculatedCurrencies(rates);
+
     return jsonResponse({
       source: 'Spring Development Bank',
       type: 'bank_rate',
       method: 'auto_login',
       tokenSource, // 'cached', 'fresh_login', or 'refreshed'
       lastUpdated,
-      rates,
+      rates: ratesWithCalculated,
       goldRate,
       timestamp: new Date().toISOString()
     });
