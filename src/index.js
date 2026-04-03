@@ -79,11 +79,16 @@ const CALCULATED_CURRENCIES = {
   CAD: { name: 'Canadian Dollar' }
 };
 
+// API Key for app authentication
+// Set this in Cloudflare dashboard: Settings > Variables > Environment Variables
+// Or in wrangler.toml: [vars] CURRENCY_API_KEY = "your-secret-key"
+const DEFAULT_API_KEY = 'oo-mm-price-2024-x7k9m2'; // Fallback key (override with env var)
+
 // CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
 };
 
 // Fetch international exchange rates for cross-rate calculations
@@ -146,6 +151,32 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // API Key validation for protected endpoints
+    const apiKey = request.headers.get('X-API-Key');
+    const validApiKey = env.CURRENCY_API_KEY || DEFAULT_API_KEY;
+
+    // Routes that require API key (currency endpoints used by apps)
+    const protectedRoutes = ['/currency', '/currency/official', '/currency/sdb'];
+    const isProtectedRoute = protectedRoutes.some(route => path === route || path.startsWith(route + '/'));
+
+    // Routes that are always public (admin, info, etc.)
+    const publicRoutes = ['/admin', '/sources', '/debug'];
+    const isPublicRoute = path === '/' || publicRoutes.some(route => path === route || path.startsWith(route + '/'));
+
+    // Validate API key for protected routes
+    if (isProtectedRoute && !isPublicRoute) {
+      if (!apiKey || apiKey !== validApiKey) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'Invalid or missing API key',
+          code: 'UNAUTHORIZED'
+        }), {
+          status: 401,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
     // Route handling
     try {
       switch (path) {
@@ -161,7 +192,7 @@ export default {
               sdb: ['/sdb/login', '/sdb/refresh', '/sdb/rates', '/sdb/decrypt'],
               meta: ['/sources'],
               debug: ['/debug/telegram/ygea', '/debug/telegram/denko', '/debug/telegram/goldcurrency'],
-              admin: ['/admin', '/admin/login', '/admin/ads', '/admin/upload', '/admin/store-rates', '/admin/backfill?days=30'],
+              admin: ['/admin', '/admin/login', '/admin/ads', '/admin/upload', '/admin/store-rates', '/admin/backfill?days=30', '/admin/settings', '/admin/overrides'],
               ads: ['/ads']
             },
             recommended: {
@@ -184,7 +215,7 @@ export default {
           });
 
         case '/currency':
-          return await getCurrencyWithSDBPrimary(env);
+          return await getCurrencyWithAdminSettings(env, url.searchParams.get('app'));
 
         case '/currency/official':
           return await getOfficialCurrency();
@@ -261,6 +292,30 @@ export default {
         case '/admin/ads':
           return await handleAdminAds(request, env);
 
+        case '/admin/settings':
+          if (request.method === 'GET') {
+            return await handleGetAdminSettings(request, env);
+          } else if (request.method === 'POST' || request.method === 'PUT') {
+            return await handleUpdateAdminSettings(request, env);
+          }
+          return jsonResponse({ error: 'Method not allowed' }, 405);
+
+        case '/admin/overrides':
+          if (request.method === 'GET') {
+            return await handleGetRateOverrides(request, env);
+          } else if (request.method === 'POST' || request.method === 'PUT') {
+            return await handleUpdateRateOverride(request, env);
+          }
+          return jsonResponse({ error: 'Method not allowed' }, 405);
+
+        case '/admin/apps':
+          if (request.method === 'GET') {
+            return await handleGetAppSettings(request, env);
+          } else if (request.method === 'POST' || request.method === 'PUT') {
+            return await handleUpdateAppSettings(request, env);
+          }
+          return jsonResponse({ error: 'Method not allowed' }, 405);
+
         case '/admin/upload':
           if (request.method === 'POST') {
             return await handleAdminUpload(request, env);
@@ -288,6 +343,18 @@ export default {
           if (adminAdMatch) {
             const adId = adminAdMatch[1];
             return await handleAdminAdById(request, env, adId);
+          }
+
+          // Admin rate override by currency code
+          const overrideMatch = path.match(/^\/admin\/overrides\/([A-Z]{3})$/i);
+          if (overrideMatch) {
+            const currencyCode = overrideMatch[1].toUpperCase();
+            if (request.method === 'DELETE') {
+              return await handleDeleteRateOverride(request, env, currencyCode);
+            } else if (request.method === 'PUT' || request.method === 'POST') {
+              return await handleUpdateRateOverride(request, env);
+            }
+            return jsonResponse({ error: 'Method not allowed' }, 405);
           }
 
           // Backfill endpoint to populate historical data
@@ -860,6 +927,59 @@ const ADMIN_HTML = `<!DOCTYPE html>
       </div>
     </header>
     <main class="max-w-6xl mx-auto py-8 px-4">
+      <!-- Currency Rate Settings -->
+      <div class="bg-white rounded-xl p-6 shadow-md mb-8">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">💱 Currency Rate Settings</h2>
+        <div class="mb-6">
+          <label class="block text-sm font-medium text-gray-700 mb-2">Primary Rate Source</label>
+          <div class="flex gap-4 flex-wrap">
+            <label class="flex items-center gap-2 cursor-pointer"><input type="radio" name="rateSource" value="mmp" class="w-4 h-4 text-purple-600"><span>MarketPricePro</span></label>
+            <label class="flex items-center gap-2 cursor-pointer"><input type="radio" name="rateSource" value="sdb" class="w-4 h-4 text-purple-600"><span>Spring Dev Bank (SDB)</span></label>
+            <label class="flex items-center gap-2 cursor-pointer"><input type="radio" name="rateSource" value="cbm" class="w-4 h-4 text-purple-600"><span>Central Bank (Official)</span></label>
+          </div>
+        </div>
+        <div class="flex gap-6 flex-wrap mb-6">
+          <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="fallbackEnabled" class="w-4 h-4 text-purple-600 rounded"><span>Enable Fallback</span></label>
+          <label class="flex items-center gap-2 cursor-pointer"><input type="checkbox" id="useOverrides" class="w-4 h-4 text-purple-600 rounded"><span>Use Manual Overrides</span></label>
+        </div>
+        <button onclick="saveRateSettings()" class="gradient-bg text-white px-6 py-2 rounded-lg font-semibold hover:opacity-90 transition">Save Settings</button>
+      </div>
+      <!-- Manual Rate Overrides -->
+      <div class="bg-white rounded-xl p-6 shadow-md mb-8">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">📊 Manual Rate Overrides</h2>
+        <p class="text-sm text-gray-500 mb-4">Set custom rates. Active overrides with sell_rate > 0 will be used.</p>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead><tr class="border-b"><th class="text-left py-2 px-2">Code</th><th class="text-left py-2 px-2">Name</th><th class="text-right py-2 px-2">Buy</th><th class="text-right py-2 px-2">Sell</th><th class="text-center py-2 px-2">Active</th></tr></thead>
+            <tbody id="overridesList"><tr><td colspan="5" class="py-4 text-center text-gray-500">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <!-- App-Specific Rate Settings -->
+      <div class="bg-white rounded-xl p-6 shadow-md mb-8">
+        <h2 class="text-xl font-bold text-gray-800 mb-4">📱 App-Specific Rate Settings</h2>
+        <p class="text-sm text-gray-500 mb-4">Configure different rate sources for each app. Apps use <code class="bg-gray-100 px-1 rounded">/currency?app=app-id</code> to get their settings.</p>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead><tr class="border-b"><th class="text-left py-2 px-2">App ID</th><th class="text-left py-2 px-2">App Name</th><th class="text-left py-2 px-2">Rate Source</th><th class="text-center py-2 px-2">Fallback</th><th class="text-center py-2 px-2">Overrides</th><th class="text-center py-2 px-2">Active</th></tr></thead>
+            <tbody id="appsList"><tr><td colspan="6" class="py-4 text-center text-gray-500">Loading...</td></tr></tbody>
+          </table>
+        </div>
+        <div class="mt-4 p-4 bg-gray-50 rounded-lg">
+          <h3 class="font-semibold text-gray-700 mb-2">Add New App</h3>
+          <div class="flex gap-4 flex-wrap">
+            <input type="text" id="newAppId" placeholder="app-id (e.g. my-app)" class="px-3 py-2 border rounded-lg w-40">
+            <input type="text" id="newAppName" placeholder="App Name" class="px-3 py-2 border rounded-lg w-40">
+            <select id="newAppSource" class="px-3 py-2 border rounded-lg">
+              <option value="mmp">MarketPricePro</option>
+              <option value="sdb">SDB</option>
+              <option value="cbm">CBM</option>
+            </select>
+            <button onclick="addNewApp()" class="gradient-bg text-white px-4 py-2 rounded-lg font-semibold hover:opacity-90">Add App</button>
+          </div>
+        </div>
+      </div>
+      <!-- Stats -->
       <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
         <div class="bg-white rounded-xl p-6 shadow-md">
           <h3 class="text-gray-500 text-sm">Total Ads</h3>
@@ -921,7 +1041,14 @@ const ADMIN_HTML = `<!DOCTYPE html>
     const API_BASE='';let authToken=localStorage.getItem('adminToken');if(authToken)verifyToken();
     async function login(){const password=document.getElementById('adminPassword').value;try{const res=await fetch(API_BASE+'/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});const data=await res.json();if(data.success){authToken=data.token;localStorage.setItem('adminToken',authToken);showDashboard()}else{document.getElementById('loginError').classList.remove('hidden')}}catch(e){document.getElementById('loginError').classList.remove('hidden')}}
     async function verifyToken(){try{const res=await fetch(API_BASE+'/admin/verify',{headers:{'Authorization':'Bearer '+authToken}});if(res.ok)showDashboard();else logout()}catch(e){logout()}}
-    function showDashboard(){document.getElementById('loginModal').classList.add('hidden');document.getElementById('mainContent').classList.remove('hidden');loadAds()}
+    function showDashboard(){document.getElementById('loginModal').classList.add('hidden');document.getElementById('mainContent').classList.remove('hidden');loadAds();loadRateSettings();loadOverrides();loadAppSettings()}
+    async function loadRateSettings(){try{const res=await fetch(API_BASE+'/admin/settings',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();if(data.success){const s=data.settings;const src=s.rate_source||'mmp';document.querySelector('input[name="rateSource"][value="'+src+'"]').checked=true;document.getElementById('fallbackEnabled').checked=s.fallback_enabled==='true';document.getElementById('useOverrides').checked=s.use_manual_overrides==='true'}}catch(e){console.error(e)}}
+    async function saveRateSettings(){const src=document.querySelector('input[name="rateSource"]:checked')?.value||'mmp';const fb=document.getElementById('fallbackEnabled').checked;const ov=document.getElementById('useOverrides').checked;try{await fetch(API_BASE+'/admin/settings',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({setting_key:'rate_source',setting_value:src})});await fetch(API_BASE+'/admin/settings',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({setting_key:'fallback_enabled',setting_value:fb.toString()})});await fetch(API_BASE+'/admin/settings',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({setting_key:'use_manual_overrides',setting_value:ov.toString()})});alert('Settings saved!')}catch(e){alert('Failed: '+e.message)}}
+    async function loadOverrides(){try{const res=await fetch(API_BASE+'/admin/overrides',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();if(data.success)renderOverrides(data.overrides)}catch(e){console.error(e)}}
+    function renderOverrides(list){const tb=document.getElementById('overridesList');if(!list.length){tb.innerHTML='<tr><td colspan="5" class="py-4 text-center text-gray-500">No overrides</td></tr>';return}tb.innerHTML=list.map(o=>'<tr class="border-b '+(o.is_active?'bg-green-50':'')+'"><td class="py-2 px-2 font-mono font-bold">'+o.currency_code+'</td><td class="py-2 px-2">'+o.currency_name+'</td><td class="py-2 px-2 text-right"><input type="number" step="0.01" value="'+(o.buy_rate||'')+'" onchange="updateOv(\\''+o.currency_code+'\\',\\'buy\\',this.value)" class="w-20 px-1 py-1 border rounded text-right text-sm"></td><td class="py-2 px-2 text-right"><input type="number" step="0.01" value="'+(o.sell_rate||'')+'" onchange="updateOv(\\''+o.currency_code+'\\',\\'sell\\',this.value)" class="w-20 px-1 py-1 border rounded text-right text-sm"></td><td class="py-2 px-2 text-center"><input type="checkbox" '+(o.is_active?'checked':'')+' onchange="toggleOv(\\''+o.currency_code+'\\',this.checked)" class="w-4 h-4"></td></tr>').join('')}
+    async function updateOv(code,type,val){const row=document.querySelector('tr:has(td:first-child)')
+    const inputs=document.querySelectorAll('input[onchange*="'+code+'"]');let buy=null,sell=0;inputs.forEach(i=>{if(i.onchange.toString().includes('buy'))buy=parseFloat(i.value)||null;if(i.onchange.toString().includes('sell'))sell=parseFloat(i.value)||0});if(type==='buy')buy=parseFloat(val)||null;if(type==='sell')sell=parseFloat(val)||0;try{await fetch(API_BASE+'/admin/overrides',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({currency_code:code,buy_rate:buy,sell_rate:sell,is_active:true})})}catch(e){alert('Failed')}}
+    async function toggleOv(code,active){try{await fetch(API_BASE+'/admin/overrides',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({currency_code:code,is_active:active})});loadOverrides()}catch(e){alert('Failed')}}
     function logout(){localStorage.removeItem('adminToken');authToken=null;document.getElementById('loginModal').classList.remove('hidden');document.getElementById('mainContent').classList.add('hidden')}
     async function loadAds(){try{const res=await fetch(API_BASE+'/admin/ads',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();document.getElementById('totalAds').textContent=data.ads.length;document.getElementById('activeAds').textContent=data.ads.filter(a=>a.is_active).length;const container=document.getElementById('adsList');if(data.ads.length===0){container.innerHTML='<p class="text-gray-500">No ads yet.</p>';return}container.innerHTML=data.ads.map(ad=>'<div class="border border-gray-200 rounded-lg p-4 flex gap-4 items-center"><img src="'+(ad.image_url||'')+'" alt="'+ad.title+'" class="w-32 h-20 object-cover rounded-lg bg-gray-200"><div class="flex-1"><h3 class="font-semibold text-gray-800">'+ad.title+'</h3><p class="text-sm text-gray-500">'+(ad.description||'')+'</p><div class="flex gap-2 mt-1">'+(ad.app_store_url?'<span class="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">iOS</span>':'')+(ad.play_store_url?'<span class="text-xs bg-green-100 text-green-700 px-2 py-1 rounded">Android</span>':'')+'<span class="text-xs '+(ad.is_active?'bg-green-100 text-green-700':'bg-red-100 text-red-700')+' px-2 py-1 rounded">'+(ad.is_active?'Active':'Inactive')+'</span></div></div><div class="flex gap-2"><button onclick="editAd(\\''+ad.id+'\\')\" class="text-purple-600 hover:text-purple-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button><button onclick="toggleAd(\\''+ad.id+'\\','+ad.is_active+')" class="text-yellow-600 hover:text-yellow-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="'+(ad.is_active?'M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636':'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z')+'"></path></svg></button><button onclick="deleteAd(\\''+ad.id+'\\')\" class="text-red-600 hover:text-red-800 p-2"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button></div></div>').join('')}catch(e){console.error(e)}}
     async function editAd(id){try{const res=await fetch(API_BASE+'/admin/ads',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();const ad=data.ads.find(a=>a.id===id);if(!ad)return;document.getElementById('adId').value=ad.id;document.getElementById('adTitle').value=ad.title;document.getElementById('adDescription').value=ad.description||'';document.getElementById('adAppStore').value=ad.app_store_url||'';document.getElementById('adPlayStore').value=ad.play_store_url||'';document.getElementById('adLinkUrl').value=ad.link_url||'';document.getElementById('currentImage').textContent=ad.image_url?'Current: '+ad.image_url.split('/').pop():'';window.scrollTo({top:0,behavior:'smooth'})}catch(e){console.error(e)}}
@@ -929,6 +1056,11 @@ const ADMIN_HTML = `<!DOCTYPE html>
     async function deleteAd(id){if(!confirm('Delete this ad?'))return;try{await fetch(API_BASE+'/admin/ads/'+id,{method:'DELETE',headers:{'Authorization':'Bearer '+authToken}});loadAds()}catch(e){console.error(e)}}
     function resetForm(){document.getElementById('adForm').reset();document.getElementById('adId').value='';document.getElementById('currentImage').textContent=''}
     document.getElementById('adForm').addEventListener('submit',async e=>{e.preventDefault();const id=document.getElementById('adId').value||'ad_'+Date.now();const imageFile=document.getElementById('adImage').files[0];let imageUrl=null;if(imageFile){const formData=new FormData();formData.append('file',imageFile);formData.append('filename',id+'.'+imageFile.name.split('.').pop());try{const uploadRes=await fetch(API_BASE+'/admin/upload',{method:'POST',headers:{'Authorization':'Bearer '+authToken},body:formData});const uploadData=await uploadRes.json();if(uploadData.url)imageUrl=uploadData.url}catch(e){alert('Upload failed');return}}const adData={id,title:document.getElementById('adTitle').value,description:document.getElementById('adDescription').value,app_store_url:document.getElementById('adAppStore').value,play_store_url:document.getElementById('adPlayStore').value,link_url:document.getElementById('adLinkUrl').value,is_active:1};if(imageUrl)adData.image_url=imageUrl;try{const isEdit=document.getElementById('adId').value;const res=await fetch(API_BASE+'/admin/ads'+(isEdit?'/'+id:''),{method:isEdit?'PUT':'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify(adData)});if(res.ok){resetForm();loadAds()}else alert('Save failed')}catch(e){console.error(e);alert('Save failed')}});
+    async function loadAppSettings(){try{const res=await fetch(API_BASE+'/admin/apps',{headers:{'Authorization':'Bearer '+authToken}});const data=await res.json();if(data.success)renderAppSettings(data.apps)}catch(e){console.error('loadAppSettings error:',e)}}
+    function renderAppSettings(list){const tb=document.getElementById('appsList');if(!list||!list.length){tb.innerHTML='<tr><td colspan="6" class="py-4 text-center text-gray-500">No apps configured</td></tr>';return}let html='';for(let i=0;i<list.length;i++){const a=list[i];const bg=a.is_active?'bg-blue-50':'bg-gray-50';const mmpSel=a.rate_source==='mmp'?' selected':'';const sdbSel=a.rate_source==='sdb'?' selected':'';const cbmSel=a.rate_source==='cbm'?' selected':'';const fbChk=a.fallback_enabled?' checked':'';const ovChk=a.use_manual_overrides?' checked':'';const actChk=a.is_active?' checked':'';html+='<tr class="border-b '+bg+'" data-app="'+a.app_id+'"><td class="py-2 px-2 font-mono font-bold">'+a.app_id+'</td><td class="py-2 px-2">'+a.app_name+'</td><td class="py-2 px-2"><select class="appSrc px-2 py-1 border rounded text-sm"><option value="mmp"'+mmpSel+'>MarketPricePro</option><option value="sdb"'+sdbSel+'>SDB</option><option value="cbm"'+cbmSel+'>CBM</option></select></td><td class="py-2 px-2 text-center"><input type="checkbox" class="appFb w-4 h-4"'+fbChk+'></td><td class="py-2 px-2 text-center"><input type="checkbox" class="appOv w-4 h-4"'+ovChk+'></td><td class="py-2 px-2 text-center"><input type="checkbox" class="appAct w-4 h-4"'+actChk+'></td></tr>';}tb.innerHTML=html;tb.querySelectorAll('.appSrc').forEach(sel=>{sel.onchange=function(){const appId=this.closest('tr').dataset.app;updateAppSource(appId,this.value);}});tb.querySelectorAll('.appFb').forEach(cb=>{cb.onchange=function(){const appId=this.closest('tr').dataset.app;updateAppFlag(appId,'fallback_enabled',this.checked);}});tb.querySelectorAll('.appOv').forEach(cb=>{cb.onchange=function(){const appId=this.closest('tr').dataset.app;updateAppFlag(appId,'use_manual_overrides',this.checked);}});tb.querySelectorAll('.appAct').forEach(cb=>{cb.onchange=function(){const appId=this.closest('tr').dataset.app;updateAppFlag(appId,'is_active',this.checked);}});}
+    async function updateAppSource(appId,src){try{await fetch(API_BASE+'/admin/apps',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({app_id:appId,rate_source:src,fallback_enabled:true,use_manual_overrides:true,is_active:true})});loadAppSettings();}catch(e){alert('Failed');}}
+    async function updateAppFlag(appId,flag,val){try{const body={app_id:appId};body[flag]=val;await fetch(API_BASE+'/admin/apps',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify(body)});loadAppSettings();}catch(e){alert('Failed');}}
+    async function addNewApp(){const appId=document.getElementById('newAppId').value.trim();const appName=document.getElementById('newAppName').value.trim();const src=document.getElementById('newAppSource').value;if(!appId){alert('App ID required');return;}try{await fetch(API_BASE+'/admin/apps',{method:'POST',headers:{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'},body:JSON.stringify({app_id:appId,app_name:appName||appId,rate_source:src,fallback_enabled:true,use_manual_overrides:true,is_active:true})});document.getElementById('newAppId').value='';document.getElementById('newAppName').value='';loadAppSettings();}catch(e){alert('Failed: '+e.message);}}
   </script>
 </body>
 </html>`;
@@ -2865,4 +2997,401 @@ async function getBestFuelPrices(env) {
 
   // Fallback to MarketPricePro
   return await getFuelPrices();
+}
+
+// ============================================
+// ADMIN SETTINGS & MANUAL RATE OVERRIDES
+// ============================================
+
+// Get admin settings from database
+async function getAdminSettings(env) {
+  if (!env?.DB) return { rate_source: 'mmp', fallback_enabled: 'true', use_manual_overrides: 'true' };
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT setting_key, setting_value FROM admin_settings'
+    ).all();
+
+    const settings = {};
+    for (const row of result.results || []) {
+      settings[row.setting_key] = row.setting_value;
+    }
+    return settings;
+  } catch (error) {
+    console.error('Failed to get admin settings:', error);
+    return { rate_source: 'mmp', fallback_enabled: 'true', use_manual_overrides: 'true' };
+  }
+}
+
+// Get active manual rate overrides from database
+async function getActiveOverrides(env) {
+  if (!env?.DB) return {};
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT currency_code, currency_name, buy_rate, sell_rate FROM manual_rate_overrides WHERE is_active = 1 AND sell_rate > 0'
+    ).all();
+
+    const overrides = {};
+    for (const row of result.results || []) {
+      overrides[row.currency_code] = {
+        name: row.currency_name,
+        buy: row.buy_rate ? row.buy_rate.toFixed(2) : null,
+        sell: row.sell_rate.toFixed(2),
+        buyFormatted: row.buy_rate ? row.buy_rate.toFixed(2) + ' MMK' : null,
+        sellFormatted: row.sell_rate.toFixed(2) + ' MMK',
+        isOverride: true
+      };
+    }
+    return overrides;
+  } catch (error) {
+    console.error('Failed to get rate overrides:', error);
+    return {};
+  }
+}
+
+// Apply manual overrides to rates
+function applyOverrides(rates, overrides) {
+  const result = { ...rates };
+  for (const [code, override] of Object.entries(overrides)) {
+    result[code] = {
+      ...result[code],
+      ...override
+    };
+  }
+  return result;
+}
+
+// Get app-specific settings (falls back to default if app not found)
+async function getAppSettings(env, appId) {
+  if (!env.DB || !appId) return null;
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT * FROM app_settings WHERE app_id = ? AND is_active = 1'
+    ).bind(appId).first();
+
+    return result;
+  } catch (e) {
+    console.log('App settings lookup failed:', e.message);
+    return null;
+  }
+}
+
+// Get currency rates with admin settings control
+async function getCurrencyWithAdminSettings(env, appId = null) {
+  try {
+    // 1. Get app-specific settings if appId provided, otherwise use global settings
+    let rateSource, fallbackEnabled, useOverrides, appName = null;
+
+    if (appId) {
+      const appSettings = await getAppSettings(env, appId);
+      if (appSettings) {
+        rateSource = appSettings.rate_source || 'mmp';
+        fallbackEnabled = appSettings.fallback_enabled === 1;
+        useOverrides = appSettings.use_manual_overrides === 1;
+        appName = appSettings.app_name;
+      }
+    }
+
+    // Fall back to global settings if no app-specific settings
+    if (!appName) {
+      const settings = await getAdminSettings(env);
+      rateSource = settings.rate_source || 'mmp';
+      fallbackEnabled = settings.fallback_enabled === 'true';
+      useOverrides = settings.use_manual_overrides === 'true';
+    }
+
+    let rates = null;
+    let source = '';
+    let error = null;
+
+    // 2. Fetch rates based on selected source
+    try {
+      if (rateSource === 'sdb') {
+        const sdbResponse = await getCurrencyWithSDBPrimary(env);
+        const sdbData = await sdbResponse.clone().json();
+        if (sdbData.rates) {
+          rates = sdbData.rates;
+          source = 'Spring Development Bank';
+        }
+      } else if (rateSource === 'mmp') {
+        const mmpResponse = await getMarketCurrency();
+        const mmpData = await mmpResponse.clone().json();
+        if (mmpData.rates) {
+          rates = mmpData.rates;
+          source = 'MarketPricePro';
+        }
+      } else if (rateSource === 'cbm') {
+        const cbmResponse = await getOfficialCurrency();
+        const cbmData = await cbmResponse.clone().json();
+        if (cbmData.rates) {
+          rates = cbmData.rates;
+          source = 'Central Bank of Myanmar';
+        }
+      }
+    } catch (e) {
+      error = e.message;
+    }
+
+    // 3. Fallback if primary failed
+    if (!rates && fallbackEnabled) {
+      try {
+        if (rateSource !== 'mmp') {
+          const mmpResponse = await getMarketCurrency();
+          const mmpData = await mmpResponse.clone().json();
+          if (mmpData.rates) {
+            rates = mmpData.rates;
+            source = 'MarketPricePro (fallback)';
+          }
+        } else {
+          const sdbResponse = await getCurrencyWithSDBPrimary(env);
+          const sdbData = await sdbResponse.clone().json();
+          if (sdbData.rates) {
+            rates = sdbData.rates;
+            source = 'Spring Development Bank (fallback)';
+          }
+        }
+      } catch (e) {
+        error = e.message;
+      }
+    }
+
+    if (!rates) {
+      return jsonResponse({
+        error: 'Failed to fetch rates from any source',
+        details: error,
+        timestamp: new Date().toISOString()
+      }, 500);
+    }
+
+    // 4. Apply manual overrides if enabled
+    let overridesApplied = [];
+    if (useOverrides) {
+      const overrides = await getActiveOverrides(env);
+      if (Object.keys(overrides).length > 0) {
+        rates = applyOverrides(rates, overrides);
+        overridesApplied = Object.keys(overrides);
+      }
+    }
+
+    return jsonResponse({
+      source,
+      type: rateSource === 'cbm' ? 'official' : 'market',
+      rates,
+      metadata: {
+        app: appName || 'default',
+        appId: appId || 'default',
+        configuredSource: rateSource,
+        fallbackEnabled,
+        overridesEnabled: useOverrides,
+        overridesApplied
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error in getCurrencyWithAdminSettings:', error);
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Get all settings
+async function handleGetAdminSettings(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  const settings = await getAdminSettings(env);
+  return jsonResponse({ success: true, settings });
+}
+
+// Admin endpoint: Update settings
+async function handleUpdateAdminSettings(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    const body = await request.json();
+    const { setting_key, setting_value } = body;
+
+    if (!setting_key || setting_value === undefined) {
+      return jsonResponse({ error: 'Missing setting_key or setting_value' }, 400);
+    }
+
+    // Validate setting_key
+    const validKeys = ['rate_source', 'fallback_enabled', 'use_manual_overrides'];
+    if (!validKeys.includes(setting_key)) {
+      return jsonResponse({ error: 'Invalid setting_key' }, 400);
+    }
+
+    // Validate rate_source value
+    if (setting_key === 'rate_source' && !['sdb', 'mmp', 'cbm'].includes(setting_value)) {
+      return jsonResponse({ error: 'rate_source must be: sdb, mmp, or cbm' }, 400);
+    }
+
+    await env.DB.prepare(
+      'UPDATE admin_settings SET setting_value = ?, updated_at = datetime("now") WHERE setting_key = ?'
+    ).bind(setting_value, setting_key).run();
+
+    return jsonResponse({ success: true, message: `Updated ${setting_key} to ${setting_value}` });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Get all rate overrides
+async function handleGetRateOverrides(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT * FROM manual_rate_overrides ORDER BY currency_code'
+    ).all();
+
+    return jsonResponse({ success: true, overrides: result.results || [] });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Update a rate override
+async function handleUpdateRateOverride(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    const body = await request.json();
+    const { currency_code, buy_rate, sell_rate, is_active, notes } = body;
+
+    if (!currency_code) {
+      return jsonResponse({ error: 'Missing currency_code' }, 400);
+    }
+
+    // Check if currency exists
+    const existing = await env.DB.prepare(
+      'SELECT id FROM manual_rate_overrides WHERE currency_code = ?'
+    ).bind(currency_code.toUpperCase()).first();
+
+    if (existing) {
+      // Update existing
+      await env.DB.prepare(
+        `UPDATE manual_rate_overrides
+         SET buy_rate = ?, sell_rate = ?, is_active = ?, notes = ?, updated_at = datetime("now")
+         WHERE currency_code = ?`
+      ).bind(
+        buy_rate || null,
+        sell_rate || 0,
+        is_active ? 1 : 0,
+        notes || null,
+        currency_code.toUpperCase()
+      ).run();
+    } else {
+      // Insert new
+      await env.DB.prepare(
+        `INSERT INTO manual_rate_overrides (currency_code, currency_name, buy_rate, sell_rate, is_active, notes)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(
+        currency_code.toUpperCase(),
+        body.currency_name || currency_code.toUpperCase(),
+        buy_rate || null,
+        sell_rate || 0,
+        is_active ? 1 : 0,
+        notes || null
+      ).run();
+    }
+
+    return jsonResponse({ success: true, message: `Updated override for ${currency_code}` });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Delete a rate override
+async function handleDeleteRateOverride(request, env, currencyCode) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    await env.DB.prepare(
+      'DELETE FROM manual_rate_overrides WHERE currency_code = ?'
+    ).bind(currencyCode.toUpperCase()).run();
+
+    return jsonResponse({ success: true, message: `Deleted override for ${currencyCode}` });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Get all app settings
+async function handleGetAppSettings(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    const result = await env.DB.prepare(
+      'SELECT * FROM app_settings ORDER BY app_name'
+    ).all();
+
+    return jsonResponse({ success: true, apps: result.results || [] });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
+}
+
+// Admin endpoint: Update app settings
+async function handleUpdateAppSettings(request, env) {
+  const authError = await checkAdminAuth(request, env);
+  if (authError) return authError;
+
+  try {
+    const body = await request.json();
+    const { app_id, app_name, rate_source, fallback_enabled, use_manual_overrides, is_active } = body;
+
+    if (!app_id) {
+      return jsonResponse({ error: 'Missing app_id' }, 400);
+    }
+
+    // Validate rate_source
+    if (rate_source && !['sdb', 'mmp', 'cbm'].includes(rate_source)) {
+      return jsonResponse({ error: 'rate_source must be: sdb, mmp, or cbm' }, 400);
+    }
+
+    // Check if app exists
+    const existing = await env.DB.prepare(
+      'SELECT id FROM app_settings WHERE app_id = ?'
+    ).bind(app_id).first();
+
+    if (existing) {
+      // Update existing
+      await env.DB.prepare(
+        `UPDATE app_settings
+         SET rate_source = ?, fallback_enabled = ?, use_manual_overrides = ?, is_active = ?, updated_at = datetime("now")
+         WHERE app_id = ?`
+      ).bind(
+        rate_source || 'mmp',
+        fallback_enabled ? 1 : 0,
+        use_manual_overrides ? 1 : 0,
+        is_active !== false ? 1 : 0,
+        app_id
+      ).run();
+    } else {
+      // Insert new
+      await env.DB.prepare(
+        `INSERT INTO app_settings (app_id, app_name, rate_source, fallback_enabled, use_manual_overrides, is_active)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(
+        app_id,
+        app_name || app_id,
+        rate_source || 'mmp',
+        fallback_enabled ? 1 : 0,
+        use_manual_overrides ? 1 : 0,
+        is_active !== false ? 1 : 0
+      ).run();
+    }
+
+    return jsonResponse({ success: true, message: `Updated settings for ${app_id}` });
+  } catch (error) {
+    return jsonResponse({ error: error.message }, 500);
+  }
 }
